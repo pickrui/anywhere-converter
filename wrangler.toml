@@ -1,6 +1,11 @@
-name = "anywhere-module-converter"
+name = "anywhere-converter"
 main = "src/worker.mjs"
 compatibility_date = "2026-06-25"
+workers_dev = true
+
+routes = [
+  { pattern = "anywhere-converter.dler.io", custom_domain = true }
+]
 
 [vars]
 MAX_INPUT_BYTES = "524288"
@@ -14,4 +19,4 @@ RATE_LIMIT_PER_MINUTE = "60"
 # Bind a KV namespace for persistent /r/:hash/:filename rule URLs in production.
 [[kv_namespaces]]
 binding = "CONVERTER_KV"
-id = "9f2831802deb407a86313433eac89b03"
+id = "41b32d1adaeb43aab8ec30d2cfea6883"
