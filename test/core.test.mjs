@@ -1,6 +1,62 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { convertAny, convertModule, convertModuleAsync, convertRuleSet, validateAnywhereOutput, internals } from "../src/core.mjs";
+import worker from "../src/worker.mjs";
+
+test("snapshot hashes isolate different conversion outputs", async () => {
+  const source = "DOMAIN-SUFFIX, example.com\n";
+  const convert = async (ruleSetRouting) => {
+    const response = await worker.fetch(new Request("https://converter.test/api/convert", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ source, sourceKind: "ruleset", name: "Hash Demo", ruleSetRouting }),
+    }), {});
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+
+  const direct = await convert("direct");
+  const reject = await convert("reject");
+  assert.notEqual(direct.hash, reject.hash);
+  assert.notEqual(direct.files[0].content, reject.files[0].content);
+});
+
+test("dynamic downloads support Unicode filenames", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("#!name=中文规则\nDOMAIN-SUFFIX, example.com\n");
+  try {
+    const response = await worker.fetch(new Request(
+      "https://converter.test/sub/rule.arrs?sourceKind=ruleset&url=https%3A%2F%2Fexample.com%2Frules.list",
+    ), {});
+    assert.equal(response.status, 200);
+    const disposition = response.headers.get("content-disposition") || "";
+    assert.match(disposition, /filename="[\x20-\x7E]+"/);
+    assert.match(disposition, /filename\*=UTF-8''/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("source fetch rejects localhost aliases before network access", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalled = false;
+  globalThis.fetch = async () => {
+    fetchCalled = true;
+    return new Response("unexpected");
+  };
+  try {
+    for (const sourceURL of ["http://localhost./rules.list", "http://[::ffff:127.0.0.1]/rules.list"]) {
+      const response = await worker.fetch(new Request(
+        `https://converter.test/sub/rule.arrs?sourceKind=ruleset&url=${encodeURIComponent(sourceURL)}`,
+      ), {});
+      assert.equal(response.status, 400);
+      assert.equal((await response.json()).error, "blocked_source_url");
+    }
+    assert.equal(fetchCalled, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 test("converts stable routing and URL-REGEX reject rules", () => {
   const source = `

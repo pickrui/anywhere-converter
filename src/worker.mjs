@@ -120,7 +120,11 @@ async function handleConvert(request, env) {
 
   const ensureSnapshotHash = async () => {
     if (!snapshotHash) {
-      snapshotHash = await sha256(input.source + "\n" + (input.name || "") + "\n" + (input.sourceUrl || "") + "\n" + scriptOverrideHash(scriptTextByURL));
+      const snapshotContent = result.files
+        .map((file) => `${file.name}\n${file.content}`)
+        .sort()
+        .join("\n\u0000\n");
+      snapshotHash = await sha256(snapshotContent);
     }
     return snapshotHash;
   };
@@ -209,7 +213,7 @@ async function handleDynamicRuleFetch(request, env) {
 
   const response = textResponse(file.content, 200, {
     "cache-control": `public, max-age=${dynamicCacheTtl(env)}`,
-    "content-disposition": `inline; filename="${file.name.replace(/"/g, "")}"`,
+    "content-disposition": contentDisposition(file.name),
     "x-converter-source": "dynamic",
     "x-converter-cache-ttl": String(dynamicCacheTtl(env)),
   });
@@ -726,7 +730,7 @@ async function putCachedFetchSource(url, source, env, options = {}) {
 }
 
 function isBlockedFetchHost(hostname) {
-  const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  const host = hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
   if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return true;
   const ipv4 = host.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
   if (ipv4) {
@@ -737,6 +741,7 @@ function isBlockedFetchHost(hostname) {
     if (a === 172 && b >= 16 && b <= 31) return true;
     if (a === 192 && b === 168) return true;
   }
+  if (host.startsWith("::ffff:")) return true;
   if (host === "::1" || host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80:")) return true;
   return false;
 }
@@ -758,6 +763,15 @@ async function sha256(value) {
   const bytes = new TextEncoder().encode(value);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("").slice(0, 16);
+}
+
+function contentDisposition(filename) {
+  const normalized = String(filename || "rules.txt").replace(/[\r\n]/g, "");
+  const fallback = normalized
+    .normalize("NFKD")
+    .replace(/[^\x20-\x7E]/g, "_")
+    .replace(/["\\]/g, "_") || "rules.txt";
+  return `inline; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(normalized)}`;
 }
 
 function maxInputBytes(env) {
