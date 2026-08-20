@@ -37,6 +37,7 @@ Status:
 | Loon/Surge rule set | Anywhere | Status | Notes |
 | --- | --- | --- | --- |
 | `DOMAIN-SUFFIX,x` with `ruleSetRouting=reject` | `2, x`, `routing = 2` | stable | Standalone rule sets often omit policy; the selected rule-set routing supplies it. |
+| large `.arrs` output | multiple `.arrs` files | stable | Routing rule files are split at 100,000 rules to stay under Anywhere's custom rule-set import/subscription limit. |
 | `DOMAIN-SUFFIX,x` with `ruleSetRouting=direct` | `2, x`, `routing = 1` | stable | Same parser, different Anywhere initial routing. |
 | `DOMAIN-SUFFIX,x` with `ruleSetRouting=default` | `2, x`, `routing = 0` | stable | Useful when the user wants the imported set to keep default handling. |
 | `example.com`, `+.example.com`, `*.example.com` | `DOMAIN-SUFFIX,example.com` -> `.arrs` | partial | Domain-set shorthand is treated as suffix matching. |
@@ -76,15 +77,18 @@ Status:
 | Loon/Surge | Anywhere | Status | Notes |
 | --- | --- | --- | --- |
 | `response-body-replace-regex search replacement` | `1, 4, pattern, search, replacement` | stable | Replacement may use `$1` / `${10}` capture templates; Anywhere expands them natively. |
+| `[Body Rewrite] http-response pattern search replacement` | `1, 4, pattern, search, replacement` | stable | Surge shorthand for response-body regex replacement; `http-request` maps to request phase. |
 | `"list":\[.+\] -> "list":[]` | `replace-recursive list []` | stable | Generic JSON-array cleanup heuristic. |
 | `response-body-json-del a.b` | `1, 5, pattern, delete, $.a.b` | stable | Loose path to JSONPath. |
 | `response-body-json-replace a true` | `1, 5, pattern, replace, $.a, true` | stable | Value kept as JSON literal/text. |
 | jq `del(.a.b)` | `body-json delete $.a.b` | stable | Whitelisted jq subset. |
 | jq `delpaths([["a","b"]])` | `body-json delete $.a.b` | stable | Single-path subset. |
+| jq `if (getpath(parent) \| has("a")) then (setpath(parent + ["a"]; value)) else . end` | `body-json replace <path> value` | stable | The checked parent plus key must exactly equal the replaced path; this preserves jq's leave-unchanged behavior when the member is absent. |
 | jq `del(.items[] | select(.x == "ad"))` | `remove-where-field-in $.items x ["ad"]` | stable | Single array path and equality only. |
 | jq `.items |= map(select(.x != "ad"))` | `remove-where-field-in $.items x ["ad"]` | stable | Single field blacklist, including `and` for the same field. |
 | jq `.items |= map(select(has("ad") | not))` | `remove-where-key-exists $.items ad` | stable | Single array path only. |
 | complex jq `map(select(...))` | script or skipped | partial | Nested arrays, regex `test`, startswith, keep-only logic, and multi-field predicates need scripts/samples. |
+| generated response script body growth | guarded passthrough | stable | Anywhere HTTP/2 response rewrite drops bodies that grow more than 65,535 bytes over the original body and logs `response grew over cap`; generated scripts skip the body commit in that case so the original response passes through cleanly. |
 
 ## Map Local
 
@@ -94,7 +98,9 @@ Status:
 | `data-type=json data="..."` | `0, 0, pattern, 2, ...` | stable | Content-Type is not preserved. |
 | `data-type=base64` | `0, 0, pattern, 4, ...` | stable | Binary fixed response. |
 | `data-type=tiny-gif` | `0, 0, pattern, 3` | stable | 1x1 GIF. |
-| `status-code=200 header="Content-Type:..."` | native fixed body | stable | Content-Type-only headers are treated as non-semantic for fixed body output. |
+| headerless `data-type=file` with a confirmed text/JSON URL | downloaded + native fixed-data body | stable | Standard conversion downloads bounded `http(s)` text resources and Base64-inlines their UTF-8 bytes; unknown/binary file types remain blocked. |
+| `data-type=file ... header="Content-Type:..."` | narrow `Anywhere.respond` script | partial | Required for header equivalence: native fixed text/data hard-code `text/plain` / `application/octet-stream`. |
+| `status-code=200 header="Content-Type:..."` | narrow `Anywhere.respond` script | partial | Explicit Content-Type is semantic and is preserved rather than discarded. |
 | `header=...` | `0, 100, pattern, base64(process)` | partial | Generated request script calls `Anywhere.respond` to preserve headers. |
 | `status-code != 200` | `0, 100, pattern, base64(process)` | partial | Generated request script preserves status and body. |
 
@@ -112,6 +118,7 @@ Status:
 | binary/protobuf script | wrapped, flagged | sample-required | See protobuf strategy. |
 | likely SSE / NDJSON / gRPC / stream response script | `op 100` compat layer + `script-buffered-stream-risk` | sample-required | Anywhere has native `op 101 stream-script`, but Loon/Surge response scripts usually expect whole-body `$response.body`. The generic converter warns instead of changing execution granularity. |
 | body-rule `Accept-Encoding` handling | native runtime clamp/decode | stable | Anywhere clamps only matching body-accessing requests and auto-decodes `gzip` / `deflate` / `br`; the converter does not emit synthetic `accept-encoding: identity` preprocess rules. |
+| compat `$done({ body })` response growth | guarded passthrough | stable | If the converted output is more than 65,535 bytes larger than `ctx.body`, the wrapper resolves without `Anywhere.done()` so Anywhere keeps the original body instead of triggering the HTTP/2 growth cap fallback. |
 
 ## Arguments
 

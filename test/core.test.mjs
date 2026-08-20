@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { convertAny, convertModule, convertModuleAsync, convertRuleSet, validateAnywhereOutput, internals } from "../src/core.mjs";
+import { convertAny, convertModule, convertModuleAsync, convertRuleSet, validateAnywhereOutput, internals, normalizeIconBase64 } from "../src/core.mjs";
 import worker from "../src/worker.mjs";
+
+const ICON_PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z3z8AAAAASUVORK5CYII=";
 
 test("snapshot hashes isolate different conversion outputs", async () => {
   const source = "DOMAIN-SUFFIX, example.com\n";
@@ -79,6 +81,41 @@ URL-REGEX, "^http:\\/\\/1\\.2\\.3\\.4\\/dns\\?", REJECT
   assert.deepEqual(validateAnywhereOutput(arrs), []);
 });
 
+test("embeds one validated icon into every generated AMRS and ARRS file", () => {
+  const source = `
+#!name = Icon Coverage
+[Rule]
+DOMAIN-SUFFIX, ads.example.com, REJECT
+[Rewrite]
+^https?:\\/\\/api\\.example\\.com\\/ad reject-dict
+[MITM]
+hostname = api.example.com
+`;
+  const result = convertModule(source, { iconLightBase64: ICON_PNG_BASE64 });
+  assert(result.files.length >= 2);
+  for (const file of result.files) {
+    assert.match(file.content, new RegExp(`^icon-light = ${ICON_PNG_BASE64}$`, "m"));
+    assert.deepEqual(validateAnywhereOutput(file), []);
+  }
+});
+
+test("rejects invalid and oversized custom icons without emitting icon headers", () => {
+  const invalid = convertModule(`#!name = Invalid Icon\n[Rule]\nDOMAIN, ads.example.com, REJECT`, { iconLightBase64: "not-an-image" });
+  assert(invalid.diagnostics.some((item) => item.code === "invalid-custom-icon"));
+  assert(!invalid.files[0].content.includes("icon-light ="));
+
+  const oversized = Buffer.concat([Buffer.from(ICON_PNG_BASE64, "base64"), Buffer.alloc(256 * 1024)]).toString("base64");
+  const result = normalizeIconBase64(oversized);
+  assert.match(result.error, /超过/);
+});
+
+test("normalizes data URI custom icons", () => {
+  const result = normalizeIconBase64(`data:image/png;base64,${ICON_PNG_BASE64}`);
+  assert.equal(result.base64, ICON_PNG_BASE64);
+  assert.equal(result.mimeType, "image/png");
+  assert(result.bytes > 0);
+});
+
 test("converts plain Loon Surge rule set to arrs with selected routing", () => {
   const result = convertRuleSet(`
 #!name = Ads Rule Set
@@ -96,6 +133,19 @@ IP-CIDR, 1.2.3.0/24, no-resolve
   assert.match(arrs.content, /3, tracker/);
   assert.match(arrs.content, /0, 1\.2\.3\.0\/24/);
   assert.deepEqual(validateAnywhereOutput(arrs), []);
+});
+
+test("splits large arrs outputs at Anywhere custom rule limit", () => {
+  const rules = Array.from({ length: 100001 }, (_, index) => `DOMAIN-SUFFIX, ads${index}.example.com`).join("\n");
+  const result = convertRuleSet(`# NAME: Huge Ads\n${rules}`, { ruleSetRouting: "reject" });
+  const arrsFiles = result.files.filter((file) => file.type === "arrs");
+  assert.equal(arrsFiles.length, 2);
+  assert.deepEqual(arrsFiles.map((file) => file.name), ["Huge_Ads_01.arrs", "Huge_Ads_02.arrs"]);
+  assert.deepEqual(arrsFiles.map((file) => file.ruleCount), [100000, 1]);
+  assert.match(arrsFiles[0].content, /name = Huge Ads 01/);
+  assert.match(arrsFiles[1].content, /name = Huge Ads 02/);
+  assert(result.diagnostics.some((item) => item.code === "arrs-rule-limit-split"));
+  for (const file of arrsFiles) assert.deepEqual(validateAnywhereOutput(file), []);
 });
 
 test("auto-detects yaml and domain-set style rule sets", () => {
@@ -617,10 +667,14 @@ hostname = api.example.com
   assert.match(generated, /status: 201/);
   assert.match(generated, /application\/json/);
   assert(result.diagnostics.some((item) => item.code === "map-local-script-response"));
+  assert.equal(result.report.scriptMetrics.scriptRuleCount, 1);
+  assert(result.report.scriptMetrics.totalScriptBytes > 0);
+  assert.equal(result.report.scriptMetrics.maxPerHitScriptBytes, result.report.scriptMetrics.totalScriptBytes);
+  assert.equal(result.report.files[0].scriptRuleCount, 1);
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
 
-test("map local with status 200 and content-type stays native", () => {
+test("map local with status 200 preserves explicit content-type using a narrow script", () => {
   const source = `
 #!name = Map Local Native Header Mini
 [Map Local]
@@ -630,11 +684,90 @@ hostname = api.example.com
 `;
   const result = convertModule(source);
   const amrs = result.files.find((file) => file.type === "amrs");
-  const ruleLine = amrs.content.split("\n").find((line) => line.startsWith("0, 0,"));
-  assert.deepEqual(internals.parseCsv(ruleLine).slice(3), ["2", "{}"]);
-  assert(!amrs.content.includes("Anywhere.respond"));
-  assert(result.diagnostics.some((item) => item.code === "map-local-native-trivial-header"));
+  const scriptLine = amrs.content.split("\n").find((line) => line.startsWith("0, 100,"));
+  const generated = Buffer.from(internals.parseCsv(scriptLine)[3], "base64").toString("utf8");
+  assert.match(generated, /Anywhere\.respond/);
+  assert.match(generated, /application\/json/);
+  assert(result.diagnostics.some((item) => item.code === "map-local-script-response"));
+  assert.equal(result.report.scriptMetrics.scriptRuleCount, 1);
   assert.deepEqual(validateAnywhereOutput(amrs), []);
+});
+
+test("downloads text Map Local files and preserves explicit response headers", async () => {
+  const sourceURL = "https://example.com/mock.json";
+  let fetchOptions = null;
+  const result = await convertModuleAsync(`
+#!name = Map Local File
+[Map Local]
+^https?:\\/\\/api\\.example\\.com\\/mock data-type=file data="${sourceURL}" status-code=200 header="Content-Type:application/json"
+[MITM]
+hostname = api.example.com
+`, {
+    fetchText: async (url, options) => {
+      assert.equal(url, sourceURL);
+      fetchOptions = options;
+      return '{"ok":true}';
+    },
+  });
+  assert.equal(fetchOptions.kind, "map-local");
+  const amrs = result.files.find((file) => file.type === "amrs");
+  const scriptLine = amrs.content.split("\n").find((line) => line.startsWith("0, 100,"));
+  const generated = Buffer.from(internals.parseCsv(scriptLine)[3], "base64").toString("utf8");
+  assert.match(generated, /Anywhere\.respond/);
+  assert.match(generated, /application\/json/);
+  assert.match(generated, new RegExp(Buffer.from('{"ok":true}').toString("base64")));
+  assert(!result.diagnostics.some((item) => item.code === "map-local-data-type-unsupported"));
+  assert.deepEqual(validateAnywhereOutput(amrs), []);
+});
+
+test("downloads headerless text Map Local files into native fixed-data", async () => {
+  const result = await convertModuleAsync(`
+#!name = Headerless Map Local File
+[Map Local]
+^https?:\\/\\/api\\.example\\.com\\/mock data-type=file data="https://example.com/mock.json"
+[MITM]
+hostname = api.example.com
+`, { fetchText: async () => "line 1\nline 2" });
+  const amrs = result.files.find((file) => file.type === "amrs");
+  const fixed = amrs.content.split("\n").find((line) => line.startsWith("0, 0,"));
+  const fields = internals.parseCsv(fixed).slice(3);
+  assert.equal(fields[0], "4");
+  assert.equal(Buffer.from(fields[1], "base64").toString("utf8"), "line 1\nline 2");
+  assert.deepEqual(validateAnywhereOutput(amrs), []);
+});
+
+test("does not fetch Map Local files that cannot be proven textual", async () => {
+  let fetched = false;
+  const result = await convertModuleAsync(`
+#!name = Binary Map Local File
+[Map Local]
+^https?:\\/\\/api\\.example\\.com\\/mock data-type=file data="https://example.com/mock.bin"
+[MITM]
+hostname = api.example.com
+`, {
+    fetchText: async () => {
+      fetched = true;
+      return "binary";
+    },
+  });
+  assert.equal(fetched, false);
+  assert.equal(result.report.status, "blocked");
+  assert(result.diagnostics.some((item) => item.code === "map-local-file-nontext"));
+});
+
+test("enforces Map Local file byte budgets", async () => {
+  const result = await convertModuleAsync(`
+#!name = Large Map Local File
+[Map Local]
+^https?:\\/\\/api\\.example\\.com\\/mock data-type=file data="https://example.com/mock.json"
+[MITM]
+hostname = api.example.com
+`, {
+    maxMapLocalBytes: 3,
+    fetchText: async () => "1234",
+  });
+  assert.equal(result.report.status, "blocked");
+  assert(result.diagnostics.some((item) => item.code === "map-local-fetch-file-too-large"));
 });
 
 test("does not emit stale content-type headers", () => {
@@ -652,6 +785,18 @@ hostname = api.example.com
 
 test("jq helper only accepts simple supported subset", () => {
   assert.deepEqual(internals.jqToBodyJson(1, "^https://a.test", "del(.data.banner)")?.fields, ["delete", "$.data.banner"]);
+  assert.deepEqual(
+    internals.jqToBodyJson(1, "^https://a.test", 'if (getpath([]) | has("data")) then (setpath(["data"]; {})) else . end')?.fields,
+    ["replace", "$.data", "{}"],
+  );
+  assert.deepEqual(
+    internals.jqToBodyJson(1, "^https://a.test", 'if (getpath(["items",0]) | has("visible")) then (setpath(["items",0,"visible"]; false)) else . end')?.fields,
+    ["replace", "$.items[0].visible", "false"],
+  );
+  assert.equal(
+    internals.jqToBodyJson(1, "^https://a.test", 'if (getpath([]) | has("data")) then (setpath(["other"]; {})) else . end'),
+    null,
+  );
   assert.deepEqual(internals.jqToBodyJson(1, "^https://a.test", "delpaths([[\"data\",\"banner\"]])")?.fields, ["delete", "$.data.banner"]);
   assert.deepEqual(internals.jqToBodyJson(1, "^https://a.test", ".items |= map(select(.type != \"ad\"))")?.fields, ["remove-where-field-in", "$.items", "type", "[\"ad\"]"]);
   assert.deepEqual(internals.jqToBodyJson(1, "^https://a.test", ".items |= map(select(.type != \"ad\" and .type != \"banner\"))")?.fields, ["remove-where-field-in", "$.items", "type", "[\"ad\",\"banner\"]"]);
@@ -659,6 +804,22 @@ test("jq helper only accepts simple supported subset", () => {
   assert.deepEqual(internals.jqToBodyJson(1, "^https://a.test", ".items |= map(select(has(\"adCategory\") | not))")?.fields, ["remove-where-key-exists", "$.items", "adCategory"]);
   assert.equal(internals.jqToBodyJson(1, "^https://a.test", ".items |= map(select(.ad|not))"), null);
   assert.equal(internals.jqToBodyJson(1, "^https://a.test", ".items |= map(select(.title | test(\"ad\"; \"i\") | not))"), null);
+});
+
+test("converts conditional existing-path jq setpath to native replace", () => {
+  const result = convertModule(`
+#!name=ZheLiBan
+[Body Rewrite]
+http-response-jq ^https?:\\/\\/portal\\.zjzwfw\\.gov\\.cn\\/app_api\\/appHome\\/selectStartPic 'if (getpath([]) | has("data")) then (setpath(["data"]; {})) else . end'
+[MITM]
+hostname = %APPEND% portal.zjzwfw.gov.cn
+`);
+  const amrs = result.files.find((file) => file.type === "amrs");
+  assert(amrs);
+  const line = amrs.content.split("\n").find((item) => item.startsWith("1, 5,"));
+  assert.deepEqual(internals.parseCsv(line).slice(3), ["replace", "$.data", "{}"]);
+  assert.equal(result.report.status, "stable");
+  assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
 
 test("converts supported complex jq filters to generated JSON scripts", () => {
@@ -679,6 +840,7 @@ hostname = api.example.com
   assert.match(generated, /remove-array-where-nested-field-in/);
   assert.match(generated, /filter-child-array-regex-not/);
   assert.match(generated, /keep-array-field-in/);
+  assert.match(generated, /outBody\.length > ctx\.body\.length \+ 65535/);
   assert(result.diagnostics.some((item) => item.code === "script-dispatcher-merged"));
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
@@ -697,6 +859,21 @@ hostname = mobile.yangkeduo.com
   assert.doesNotMatch(amrs.content, /accept-encoding, identity/);
   const bodyReplaceLine = amrs.content.split("\n").find((line) => line.startsWith("1, 5,"));
   assert.deepEqual(internals.parseCsv(bodyReplaceLine).slice(3), ["replace-recursive", "list", "[]"]);
+  assert.deepEqual(validateAnywhereOutput(amrs), []);
+});
+
+test("converts Surge Body Rewrite http-response shorthand", () => {
+  const result = convertModule(`
+#!name = Body Rewrite Shorthand
+[Body Rewrite]
+http-response ^https?:\\/\\/api\\.example\\.com\\/config "splash":true "splash":false
+[MITM]
+hostname = api.example.com
+`);
+  const amrs = result.files.find((file) => file.type === "amrs");
+  const line = amrs.content.split("\n").find((item) => item.startsWith("1, 4,"));
+  assert.deepEqual(internals.parseCsv(line).slice(3), ['"splash":true', '"splash":false']);
+  assert.equal(result.report.status, "stable");
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
 
@@ -1629,7 +1806,9 @@ $done($response);
   const wrapped = Buffer.from(internals.parseCsv(line)[3], "base64").toString("utf8");
   assert.match(wrapped, /var __binaryBodyMode = true/);
   assert.match(wrapped, /body: __binaryBodyMode \? __bodyBytes : __bodyText/);
-  assert.match(wrapped, /ctx\.body = __bodyOut\(\$response\.body\)/);
+  assert.match(wrapped, /var __responseGrowthCapBytes = 65535/);
+  assert.match(wrapped, /__originalBodyLength >= 0/);
+  assert.match(wrapped, /__setBodyIfWithinCap\(__bodyOut\(\$response\.body\)\)/);
   assert(result.diagnostics.some((item) => item.code === "script-binary-sample-required"));
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });

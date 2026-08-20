@@ -12,6 +12,9 @@ const ROUTING_TYPES = {
 };
 
 const MITM_OPS = new Set([0, 1, 2, 3, 4, 5, 100, 101]);
+const MAX_AMRS_RULES_PER_FILE = 10000;
+const MAX_ARRS_RULES_PER_FILE = 100000;
+const MAX_ICON_BYTES = 256 * 1024;
 const FRAMING_HEADERS = new Set([
   "content-length",
   "transfer-encoding",
@@ -44,6 +47,7 @@ export function convertModule(source, options = {}) {
   const mode = normalizeMode(options.mode, options.fetchScripts);
   const parsed = parseModule(source, options);
   const diagnostics = [...parsed.diagnostics];
+  const iconLight = resolveOutputIcon(options.iconLightBase64, diagnostics);
   const argumentValues = resolveArgumentValues(parsed.arguments, options.arguments);
   const preserveParameters = shouldPreserveParameters(options);
   const referencedArguments = preserveParameters ? collectReferencedArguments(parsed.items) : new Set();
@@ -147,7 +151,7 @@ export function convertModule(source, options = {}) {
       break;
     }
     case "Map Local": {
-      const mapped = convertMapLocalLine(item);
+      const mapped = convertMapLocalLine(item, options);
       if (mapped?.rule) {
         addMitm(mapped.rule, item.line, item.raw);
         for (const diagnostic of mapped.diagnostics || []) {
@@ -216,19 +220,14 @@ export function convertModule(source, options = {}) {
     files.push({
       name: filenameFromName(name, ".amrs"),
       type: "amrs",
-      content: emitAmrs(name, hostnames, mitmRules, parameters),
+      content: emitAmrs(name, hostnames, mitmRules, parameters, iconLight),
       ruleCount: mitmRules.length,
     });
   }
 
   for (const [groupName, group] of routingGroups) {
     if (!group.rules.length) continue;
-    files.push({
-      name: filenameFromName(`${name}_${groupName}`, ".arrs"),
-      type: "arrs",
-      content: emitArrs(`${name} ${groupName}`, group.routing, group.rules),
-      ruleCount: group.rules.length,
-    });
+    appendArrsFiles(files, `${name}_${groupName}`, `${name} ${groupName}`, group.routing, group.rules, diagnostics, iconLight);
   }
 
   const report = buildReport({ converted, skipped, files, diagnostics });
@@ -251,6 +250,8 @@ export async function convertModuleAsync(source, options = {}) {
   const argumentValues = resolveArgumentValues(parsed.arguments, options.arguments);
   const scriptTextByURL = { ...(options.scriptTextByURL || {}) };
   const scriptSourceStatusByURL = {};
+  const mapLocalTextByURL = { ...(options.mapLocalTextByURL || {}) };
+  const mapLocalSourceStatusByURL = {};
   const diagnostics = [];
   const fetchText = options.fetchText;
   const maxScriptBytes = Number(options.maxScriptBytes || 1024 * 1024);
@@ -334,8 +335,50 @@ export async function convertModuleAsync(source, options = {}) {
         diagnostics.push(diagnostic);
       }
     }
+
+    const maxMapLocalBytes = Number(options.maxMapLocalBytes || 512 * 1024);
+    const maxTotalMapLocalBytes = Number(options.maxTotalMapLocalBytes || 2 * 1024 * 1024);
+    const maxMapLocalFetchesValue = Number(options.maxMapLocalFetches || 16);
+    const maxMapLocalFetches = Number.isFinite(maxMapLocalFetchesValue) && maxMapLocalFetchesValue > 0 ? maxMapLocalFetchesValue : 16;
+    const attemptedMapLocalURLs = new Set(Object.keys(mapLocalTextByURL));
+    let fetchedMapLocalBytes = Object.values(mapLocalTextByURL).reduce((sum, text) => sum + byteLength(text), 0);
+    let mapLocalFetchAttempts = 0;
+    for (const originalItem of parsed.items.filter((entry) => entry.section === "Map Local")) {
+      const resolvedItem = resolveItemArguments(originalItem, argumentValues);
+      if (!resolvedItem.enabled) continue;
+      const item = resolvedItem.item;
+      const descriptor = parseMapLocalDescriptor(item.text);
+      if (!descriptor || descriptor.dataType !== "file" || !/^https?:\/\//i.test(descriptor.data)) continue;
+      if (!mapLocalFileIsText(descriptor) || attemptedMapLocalURLs.has(descriptor.data)) continue;
+      attemptedMapLocalURLs.add(descriptor.data);
+      let failure = null;
+      if (mapLocalFetchAttempts >= maxMapLocalFetches) {
+        failure = ["map-local-fetch-count-exceeded", `Map Local 文件下载数量超过本次转换上限 ${maxMapLocalFetches}：${descriptor.data}`];
+      } else if (fetchedMapLocalBytes >= maxTotalMapLocalBytes) {
+        failure = ["map-local-fetch-budget-exceeded", `Map Local 文件总下载预算已用尽：${descriptor.data}`];
+      }
+      if (failure) {
+        mapLocalSourceStatusByURL[descriptor.data] = { code: failure[0], message: failure[1] };
+        continue;
+      }
+      try {
+        mapLocalFetchAttempts += 1;
+        const text = await fetchText(descriptor.data, { maxBytes: maxMapLocalBytes, kind: "map-local" });
+        const size = byteLength(text);
+        if (size > maxMapLocalBytes) {
+          mapLocalSourceStatusByURL[descriptor.data] = { code: "map-local-fetch-file-too-large", message: `Map Local 文件超过单文件预算 ${maxMapLocalBytes} bytes：${descriptor.data}` };
+        } else if (fetchedMapLocalBytes + size > maxTotalMapLocalBytes) {
+          mapLocalSourceStatusByURL[descriptor.data] = { code: "map-local-fetch-budget-exceeded", message: `Map Local 文件超过总下载预算 ${maxTotalMapLocalBytes} bytes：${descriptor.data}` };
+        } else {
+          mapLocalTextByURL[descriptor.data] = text;
+          fetchedMapLocalBytes += size;
+        }
+      } catch (error) {
+        mapLocalSourceStatusByURL[descriptor.data] = { code: "map-local-fetch-failed", message: `Map Local 文件下载失败：${descriptor.data} (${error?.message || error})` };
+      }
+    }
   }
-  const result = convertModule(source, { ...options, scriptTextByURL, scriptSourceStatusByURL });
+  const result = convertModule(source, { ...options, scriptTextByURL, scriptSourceStatusByURL, mapLocalTextByURL, mapLocalSourceStatusByURL });
   result.diagnostics.unshift(...diagnostics);
   result.report = buildReport({
     converted: result.report.converted,
@@ -383,6 +426,7 @@ export async function convertAnyAsync(source, options = {}) {
 export function convertRuleSet(source, options = {}) {
   const parsed = parseRuleSet(source);
   const diagnostics = [...parsed.diagnostics];
+  const iconLight = resolveOutputIcon(options.iconLightBase64, diagnostics);
   const defaultRouting = normalizeRuleSetRouting(options.ruleSetRouting ?? options.routing);
   const routingGroups = new Map();
   const seenRoutingRules = new Set();
@@ -437,7 +481,7 @@ export function convertRuleSet(source, options = {}) {
     files.push({
       name: filenameFromName(name, ".amrs"),
       type: "amrs",
-      content: emitAmrs(name, hostnames, mitmRules),
+      content: emitAmrs(name, hostnames, mitmRules, [], iconLight),
       ruleCount: mitmRules.length,
     });
   }
@@ -445,12 +489,8 @@ export function convertRuleSet(source, options = {}) {
     group.rules = dedupeRoutingRules(group.rules);
     if (!group.rules.length) continue;
     const suffix = group.routing === defaultRouting ? "" : `_${groupName}`;
-    files.push({
-      name: filenameFromName(`${name}${suffix}`, ".arrs"),
-      type: "arrs",
-      content: emitArrs(name, group.routing, group.rules),
-      ruleCount: group.rules.length,
-    });
+    const displayName = group.routing === defaultRouting ? name : `${name} ${groupName}`;
+    appendArrsFiles(files, `${name}${suffix}`, displayName, group.routing, group.rules, diagnostics, iconLight);
   }
 
   const report = buildReport({ converted, skipped, files, diagnostics });
@@ -955,11 +995,12 @@ function isRuleSetPolicyAction(action = "") {
   return routeForAction(text) != null || isRejectAction(text);
 }
 
-export function emitAmrs(name, hostnames, rules, parameters = []) {
+export function emitAmrs(name, hostnames, rules, parameters = [], iconLight = "") {
   const lines = [
     `# Generated by Anywhere Loon/Surge converter`,
     `name = ${name}`,
   ];
+  if (iconLight) lines.push(`icon-light = ${iconLight}`);
   if (hostnames.length) lines.push(`hostname = ${hostnames.join(", ")}`);
   lines.push("");
   if (parameters.length) {
@@ -971,15 +1012,48 @@ export function emitAmrs(name, hostnames, rules, parameters = []) {
   return lines.join("\n").trimEnd() + "\n";
 }
 
-export function emitArrs(name, routing, rules) {
+export function emitArrs(name, routing, rules, iconLight = "") {
   const lines = [
     `# Generated by Anywhere Loon/Surge converter`,
     `name = ${name}`,
-    `routing = ${routing}`,
-    "",
   ];
+  if (iconLight) lines.push(`icon-light = ${iconLight}`);
+  lines.push(`routing = ${routing}`, "");
   for (const rule of rules) lines.push(`${rule.type}, ${rule.value}`);
   return lines.join("\n").trimEnd() + "\n";
+}
+
+function appendArrsFiles(files, fileBaseName, displayName, routing, rules, diagnostics = [], iconLight = "") {
+  const chunks = chunkRules(rules, MAX_ARRS_RULES_PER_FILE);
+  if (chunks.length > 1) {
+    diagnostics.push({
+      level: "info",
+      code: "arrs-rule-limit-split",
+      message: `ARRS 规则数 ${rules.length} 超过 Anywhere 单个自定义规则集上限 ${MAX_ARRS_RULES_PER_FILE}，已自动拆分为 ${chunks.length} 个文件。`,
+      line: 0,
+      source: "",
+    });
+  }
+  chunks.forEach((chunk, index) => {
+    const numbered = chunks.length > 1;
+    const suffix = numbered ? `_${String(index + 1).padStart(2, "0")}` : "";
+    const titleSuffix = numbered ? ` ${String(index + 1).padStart(2, "0")}` : "";
+    files.push({
+      name: filenameFromName(`${fileBaseName}${suffix}`, ".arrs"),
+      type: "arrs",
+      content: emitArrs(`${displayName}${titleSuffix}`, routing, chunk, iconLight),
+      ruleCount: chunk.length,
+    });
+  });
+}
+
+function chunkRules(rules, maxRules) {
+  if (!Array.isArray(rules) || rules.length <= maxRules) return [rules || []];
+  const chunks = [];
+  for (let index = 0; index < rules.length; index += maxRules) {
+    chunks.push(rules.slice(index, index + maxRules));
+  }
+  return chunks;
 }
 
 export function validateAnywhereOutput(file) {
@@ -988,6 +1062,7 @@ export function validateAnywhereOutput(file) {
   const isAmrs = file.name?.endsWith(".amrs") || file.type === "amrs";
   const isArrs = file.name?.endsWith(".arrs") || file.type === "arrs";
   let amrsSection = "rule";
+  let ruleCount = 0;
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i].trim();
     if (!raw || raw.startsWith("#") || raw.startsWith("//")) continue;
@@ -1005,7 +1080,7 @@ export function validateAnywhereOutput(file) {
     const commaIndex = raw.indexOf(",");
     const headerLike = equalIndex >= 0 && (commaIndex < 0 || equalIndex < commaIndex);
     const maybeHeader = headerLike ? raw.split("=", 1)[0].trim().toLowerCase() : "";
-    const allowed = isAmrs ? new Set(["name", "hostname"]) : new Set(["name", "routing"]);
+    const allowed = isAmrs ? new Set(["name", "hostname", "icon-light", "icon-dark"]) : new Set(["name", "routing", "icon-light", "icon-dark"]);
     if (maybeHeader) {
       if (!allowed.has(maybeHeader)) diagnostics.push({ level: "error", code: "unknown-header", line: i + 1, message: `当前 Anywhere 不识别 ${maybeHeader} header。` });
       continue;
@@ -1013,10 +1088,18 @@ export function validateAnywhereOutput(file) {
     if (isAmrs) {
       const result = amrsSection === "parameter" ? validateAmrsParameterLine(raw) : validateAmrsRuleLine(raw);
       if (result) diagnostics.push({ ...result, line: i + 1 });
+      else if (amrsSection === "rule") ruleCount += 1;
     } else if (isArrs) {
       const result = validateArrsRuleLine(raw);
       if (result) diagnostics.push({ ...result, line: i + 1 });
+      else ruleCount += 1;
     }
+  }
+  if (isAmrs && ruleCount > MAX_AMRS_RULES_PER_FILE) {
+    diagnostics.push({ level: "error", code: "amrs-rule-limit-exceeded", line: 0, message: `AMRS 单文件规则数 ${ruleCount} 超过 Anywhere 上限 ${MAX_AMRS_RULES_PER_FILE}。` });
+  }
+  if (isArrs && ruleCount > MAX_ARRS_RULES_PER_FILE) {
+    diagnostics.push({ level: "error", code: "arrs-rule-limit-exceeded", line: 0, message: `ARRS 单文件规则数 ${ruleCount} 超过 Anywhere 上限 ${MAX_ARRS_RULES_PER_FILE}。` });
   }
   return diagnostics;
 }
@@ -1224,6 +1307,14 @@ function convertRewriteLine(item) {
 }
 
 function convertBodyRewriteLine(item) {
+  const typedRewrite = splitLeadingToken(item.text);
+  const typedAction = typedRewrite?.[0]?.toLowerCase();
+  if (typedAction === "http-response" || typedAction === "http-request") {
+    const patternAndBody = splitLeadingToken(typedRewrite[1]);
+    if (!patternAndBody) return null;
+    return bodyReplaceRule(typedAction === "http-response" ? 1 : 0, patternAndBody[0], splitBodyReplaceParts(patternAndBody[1]));
+  }
+
   const rawRewrite = parseRewriteCommand(item.text);
   if (rawRewrite?.action === "http-response-replace-regex" || rawRewrite?.action === "response-body-replace-regex") {
     return bodyReplaceRule(1, rawRewrite.pattern, splitBodyReplaceParts(rawRewrite.rest));
@@ -1244,22 +1335,33 @@ function convertBodyRewriteLine(item) {
   return null;
 }
 
-function convertMapLocalLine(item) {
-  const split = splitLeadingToken(item.text);
-  if (!split) return null;
-  const [pattern, rest] = split;
-  const options = parseKeyValueTokens(rest);
-  const dataType = (options["data-type"] || "text").toLowerCase();
-  const data = options.data ?? "";
+function convertMapLocalLine(item, conversionOptions = {}) {
+  const descriptor = parseMapLocalDescriptor(item.text);
+  if (!descriptor) return null;
+  const { pattern, sourceOptions } = descriptor;
+  let dataType = descriptor.dataType;
+  let data = descriptor.data;
   const diagnostics = [];
-  const status = Number(options["status-code"] || 200);
-  if (options.header || status !== 200) {
-    const nativeRule = mapLocalNativeRuleWithTrivialHeader(pattern, { dataType, data, status, header: options.header || "" });
+  if (dataType === "file") {
+    if (!/^https?:\/\//i.test(data)) return { code: "map-local-file-url-unsupported", message: `Map Local file 只支持 http(s) URL：${data}` };
+    if (!mapLocalFileIsText(descriptor)) return { code: "map-local-file-nontext", message: `Map Local file 无法确认是文本资源，已跳过：${data}` };
+    const sourceURL = data;
+    const fetched = conversionOptions.mapLocalTextByURL?.[sourceURL];
+    if (typeof fetched !== "string") {
+      const failure = conversionOptions.mapLocalSourceStatusByURL?.[sourceURL];
+      return { code: failure?.code || "map-local-file-source-missing", message: failure?.message || `Map Local 文件未下载：${sourceURL}` };
+    }
+    data = base64(fetched);
+    dataType = "base64";
+  }
+  const status = Number(sourceOptions["status-code"] || 200);
+  if (sourceOptions.header || status !== 200) {
+    const nativeRule = mapLocalNativeRuleWithTrivialHeader(pattern, { dataType, data, status, header: sourceOptions.header || "" });
     if (nativeRule) {
       diagnostics.push({ level: "info", code: "map-local-native-trivial-header", message: "Map Local 仅包含 200/content-type，已映射为原生 fixed body 规则。" });
       return { rule: nativeRule, diagnostics };
     }
-    const rule = mapLocalRespondScriptRule(pattern, { dataType, data, status, header: options.header || "" });
+    const rule = mapLocalRespondScriptRule(pattern, { dataType, data, status, header: sourceOptions.header || "" });
     if (!rule) return { code: "map-local-data-type-unsupported", message: `Map Local data-type=${dataType} 不能安全映射。` };
     diagnostics.push({ level: "warning", code: "map-local-script-response", message: "Map Local 需要保留 status/header，已生成 request script 调用 Anywhere.respond；请实机确认 content-type/body 语义。" });
     return { rule, diagnostics };
@@ -1276,10 +1378,38 @@ function convertMapLocalLine(item) {
   return { code: "map-local-data-type-unsupported", message: `Map Local data-type=${dataType} 不能安全映射。` };
 }
 
+function parseMapLocalDescriptor(text) {
+  const split = splitLeadingToken(text);
+  if (!split) return null;
+  const [pattern, rest] = split;
+  const sourceOptions = parseKeyValueTokens(rest);
+  return {
+    pattern,
+    sourceOptions,
+    dataType: (sourceOptions["data-type"] || "text").toLowerCase(),
+    data: sourceOptions.data ?? "",
+  };
+}
+
+function mapLocalContentType(descriptor) {
+  const headers = parseExplicitHeaderList(descriptor?.sourceOptions?.header || "");
+  return String(headers.find(([name]) => name === "content-type")?.[1] || "").toLowerCase();
+}
+
+function mapLocalFileIsText(descriptor) {
+  const contentType = mapLocalContentType(descriptor);
+  if (/^(?:text\/)|(?:json|javascript|xml|yaml)/i.test(contentType)) return true;
+  try {
+    return /\.(?:json|txt|js|mjs|css|html?|xml|ya?ml)$/i.test(new URL(descriptor.data).pathname);
+  } catch {
+    return false;
+  }
+}
+
 function mapLocalNativeRuleWithTrivialHeader(pattern, options) {
   if (options.status !== 200) return null;
   const explicitHeaders = parseExplicitHeaderList(options.header || "");
-  if (explicitHeaders.some(([name]) => name !== "content-type")) return null;
+  if (explicitHeaders.length) return null;
   const type = String(options.dataType || "text").toLowerCase();
   if (type === "base64") return { phase: 0, op: 0, pattern: urlGate(pattern), fields: ["4", options.data] };
   if (type === "tiny-gif" || type === "gif") return { phase: 0, op: 0, pattern: urlGate(pattern), fields: ["3"] };
@@ -2596,6 +2726,18 @@ function wrapLoonSurgeScript(source, parsed) {
     if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
     return Anywhere.codec.utf8.encode(String(value == null ? "" : value));
   }
+  var __responseGrowthCapBytes = 65535;
+  var __originalBodyLength = ctx.body && typeof ctx.body.length === "number" ? ctx.body.length : -1;
+  function __setBodyIfWithinCap(bytes) {
+    if ("${phase}" === "response" && __originalBodyLength >= 0 && bytes && bytes.length > __originalBodyLength + __responseGrowthCapBytes) return false;
+    ctx.body = bytes;
+    return true;
+  }
+  function __finishUnchanged() {
+    if (__finished) return;
+    __finished = true;
+    __resolveDone();
+  }
   var $request = { url: ctx.url || "", method: ctx.method || "GET", headers: __headersObject(ctx.headers), body: __binaryBodyMode ? __bodyBytes : __bodyText, bodyBytes: __bodyBytes };
   var $response = { status: ctx.status || 200, statusCode: ctx.status || 200, headers: __headersObject(ctx.headers), body: __binaryBodyMode ? __bodyBytes : __bodyText, bodyBytes: __bodyBytes };
   var $environment = { system: "Anywhere", "surge-version": "0", "loon-version": "0" };
@@ -2698,9 +2840,15 @@ ${argumentHelper}  var $argument = ${argumentExpression};
       return;
     }
     if (value && Object.prototype.hasOwnProperty.call(value, "body")) {
-      ctx.body = __bodyOut(value.body);
+      if (!__setBodyIfWithinCap(__bodyOut(value.body))) {
+        __finishUnchanged();
+        return;
+      }
     } else if (typeof $response !== "undefined" && "${phase}" === "response" && (__binaryBodyMode ? $response.body !== __bodyBytes : $response.body !== __bodyText)) {
-      ctx.body = __bodyOut($response.body);
+      if (!__setBodyIfWithinCap(__bodyOut($response.body))) {
+        __finishUnchanged();
+        return;
+      }
     }
     __finish();
   }
@@ -2747,6 +2895,9 @@ function jqToBodyJson(phase, pattern, rawJq) {
   let match = jq.match(/^del\(\s*(\.[^)]+?)\s*\)$/);
   if (match) return { phase, op: 5, pattern: urlGate(pattern), fields: ["delete", jsonPathFromJq(match[1])] };
 
+  const conditionalReplace = jqConditionalExistingPathReplace(phase, pattern, jq);
+  if (conditionalReplace) return conditionalReplace;
+
   match = jq.match(/^del\(\s*(\.[A-Za-z0-9_.$[\]"'-]+)\[\]\s*\|\s*select\(\s*\.([A-Za-z0-9_$-]+)\s*==\s*(["'][^"']+["'])\s*\)\s*\)$/);
   if (match) {
     return {
@@ -2772,6 +2923,42 @@ function jqToBodyJson(phase, pattern, rawJq) {
     return { phase, op: 5, pattern: urlGate(pattern), fields: ["replace", jsonPathFromJq(left), match[1].trim()] };
   }
   return null;
+}
+
+function jqConditionalExistingPathReplace(phase, pattern, jq) {
+  const match = jq.match(/^if\s*\(\s*getpath\(\s*(\[[^\]]*\])\s*\)\s*\|\s*has\(\s*(["'][^"']+["'])\s*\)\s*\)\s*then\s*\(\s*setpath\(\s*(\[[^\]]*\])\s*;\s*([\s\S]+?)\s*\)\s*\)\s*else\s*\.\s*end$/);
+  if (!match) return null;
+  const parentPath = parseJqPathArray(match[1]);
+  const checkedKey = unquote(match[2]);
+  const replacedPath = parseJqPathArray(match[3]);
+  if (!parentPath || !replacedPath || !checkedKey) return null;
+  const expectedPath = [...parentPath, checkedKey];
+  if (JSON.stringify(replacedPath) !== JSON.stringify(expectedPath)) return null;
+  const value = parseJsLiteralForRule(match[4]);
+  if (value == null) return null;
+  const path = jsonPathFromParts(replacedPath);
+  return { phase, op: 5, pattern: urlGate(pattern), fields: ["replace", path, value] };
+}
+
+function parseJqPathArray(raw) {
+  try {
+    const parts = JSON.parse(raw);
+    if (!Array.isArray(parts)) return null;
+    if (!parts.every((part) => typeof part === "string" || (Number.isInteger(part) && part >= 0))) return null;
+    return parts;
+  } catch {
+    return null;
+  }
+}
+
+function jsonPathFromParts(parts) {
+  let path = "$";
+  for (const part of parts) {
+    if (typeof part === "number") path += `[${part}]`;
+    else if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(part)) path += `.${part}`;
+    else path += `[${JSON.stringify(part)}]`;
+  }
+  return path;
 }
 
 function jqMapSelectRemoval(phase, pattern, jq) {
@@ -2981,7 +3168,9 @@ function jsonOpsScript(ops) {
   }
 
   if (!changed) return;
-  ctx.body = Anywhere.codec.utf8.encode(JSON.stringify(obj));
+  var outBody = Anywhere.codec.utf8.encode(JSON.stringify(obj));
+  if (ctx.body && outBody.length > ctx.body.length + 65535) return;
+  ctx.body = outBody;
   Anywhere.done();
 }`;
 }
@@ -3170,17 +3359,45 @@ function buildReport({ converted, skipped, files, diagnostics }) {
       : hasPartial
         ? "partial"
         : "stable";
+  const reportedFiles = files.map((file) => ({ name: file.name, type: file.type, ruleCount: file.ruleCount, ...scriptMetricsForFile(file) }));
+  const scriptMetrics = {
+    scriptRuleCount: reportedFiles.reduce((sum, file) => sum + file.scriptRuleCount, 0),
+    totalScriptBytes: reportedFiles.reduce((sum, file) => sum + file.totalScriptBytes, 0),
+    maxPerHitScriptBytes: reportedFiles.reduce((max, file) => Math.max(max, file.maxPerHitScriptBytes), 0),
+  };
   return {
     status,
     converted,
     skipped,
     fileCount: files.length,
-    files: files.map((file) => ({ name: file.name, type: file.type, ruleCount: file.ruleCount })),
+    files: reportedFiles,
+    scriptMetrics,
     diagnostics: diagnostics.reduce((acc, item) => {
       acc[item.level] = (acc[item.level] || 0) + 1;
       return acc;
     }, {}),
   };
+}
+
+function scriptMetricsForFile(file) {
+  const metrics = { scriptRuleCount: 0, totalScriptBytes: 0, maxPerHitScriptBytes: 0 };
+  if (file.type !== "amrs" || !file.content) return metrics;
+  for (const line of String(file.content).split(/\r?\n/)) {
+    if (!/^[01],\s*(?:100|101),/.test(line)) continue;
+    const fields = parseCsv(line);
+    const bytes = decodedBase64Length(fields[3] || "");
+    metrics.scriptRuleCount += 1;
+    metrics.totalScriptBytes += bytes;
+    metrics.maxPerHitScriptBytes = Math.max(metrics.maxPerHitScriptBytes, bytes);
+  }
+  return metrics;
+}
+
+function decodedBase64Length(value) {
+  const text = String(value || "").replace(/\s+/g, "");
+  if (!text || text.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(text)) return 0;
+  const padding = text.endsWith("==") ? 2 : text.endsWith("=") ? 1 : 0;
+  return text.length / 4 * 3 - padding;
 }
 
 function normalizeHostnames(values, diagnostics) {
@@ -3933,6 +4150,60 @@ function base64(value) {
   for (const byte of bytes) binary += String.fromCharCode(byte);
   if (typeof btoa === "function") return btoa(binary);
   return globalThis.Buffer.from(bytes).toString("base64");
+}
+
+export function normalizeIconBase64(value, maxBytes = MAX_ICON_BYTES) {
+  let text = String(value || "").trim();
+  if (!text) return { base64: "", mimeType: "", bytes: 0 };
+  const dataUri = text.match(/^data:([^;,]+);base64,([\s\S]+)$/i);
+  if (dataUri) text = dataUri[2];
+  text = text.replace(/\s+/g, "");
+  if (!text || text.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(text)) {
+    return { error: "图标不是有效的 Base64。" };
+  }
+  let bytes;
+  try {
+    bytes = decodeBase64Bytes(text);
+  } catch {
+    return { error: "图标 Base64 无法解码。" };
+  }
+  const limit = Math.min(MAX_ICON_BYTES, Number(maxBytes) > 0 ? Number(maxBytes) : MAX_ICON_BYTES);
+  if (!bytes.length) return { error: "图标内容为空。" };
+  if (bytes.length > limit) return { error: `图标超过 ${limit} bytes 上限。` };
+  const mimeType = imageMimeType(bytes);
+  if (!mimeType) return { error: "图标只支持 PNG、JPEG、WebP 或 GIF 图片。" };
+  return { base64: text, mimeType, bytes: bytes.length };
+}
+
+function resolveOutputIcon(value, diagnostics) {
+  if (!String(value || "").trim()) return "";
+  const normalized = normalizeIconBase64(value);
+  if (normalized.error) {
+    diagnostics.push({ level: "error", code: "invalid-custom-icon", message: normalized.error, line: 0, source: "" });
+    return "";
+  }
+  return normalized.base64;
+}
+
+function decodeBase64Bytes(value) {
+  if (typeof atob === "function") {
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    return bytes;
+  }
+  return new Uint8Array(globalThis.Buffer.from(value, "base64"));
+}
+
+function imageMimeType(bytes) {
+  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47
+    && bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) return "image/png";
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+  if (bytes.length >= 6 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46
+    && bytes[3] === 0x38 && (bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61) return "image/gif";
+  if (bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46
+    && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return "image/webp";
+  return "";
 }
 
 function isTruthy(value) {
