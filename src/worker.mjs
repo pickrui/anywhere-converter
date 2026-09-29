@@ -1,3 +1,4 @@
+import { BoundedCache, InputError, readBytes, fetchRemote, isBlockedFetchHost } from "./worker-io.mjs";
 import { convertAnyAsync, detectSourceKind, internals, normalizeIconBase64, parseModule, parseRuleSet, validateAnywhereOutput } from "./core.mjs";
 import { buildArrs } from "./ruleset-core.mjs";
 import { RuleSetWorkspace } from "./ruleset-workspace.mjs";
@@ -6,13 +7,12 @@ import { renderAppIcon, renderHome, renderManifest, renderServiceWorker } from "
 export { RuleSetWorkspace };
 
 const memoryStore = new Map();
-const memoryRateStore = new Map();
-const memoryFetchCache = new Map();
-const memoryDynamicCache = new Map();
-const memoryIconCache = new Map();
+const memoryRateStore = new BoundedCache();
+const memoryFetchCache = new BoundedCache();
+const memoryDynamicCache = new BoundedCache();
+const memoryIconCache = new BoundedCache();
 const memoryRuleSetWorkspaces = new Map();
-const memoryPublishedRuleSets = new Map();
-const memoryPublicRuleSetCache = new Map();
+const memoryPublicRuleSetCache = new BoundedCache();
 
 export default {
   async fetch(request, env) {
@@ -71,11 +71,12 @@ export default {
       if (request.method === "GET" && url.pathname.startsWith("/r/")) return await handleRuleFetch(url, env);
       return jsonResponse({ error: "not_found" }, 404);
     } catch (error) {
+      if (error instanceof InputError) return jsonResponse({ error: error.code }, error.status);
       const isSyntaxError = error instanceof SyntaxError;
       const status = isSyntaxError ? 400 : 500;
       return jsonResponse({
         error: isSyntaxError ? "invalid_json" : "internal_error",
-        detail: error?.message || "Worker failed while handling the request.",
+        detail: isSyntaxError ? "Invalid JSON payload." : "Worker failed while handling the request.",
       }, status);
     }
   },
@@ -110,7 +111,6 @@ async function handleWorkspaceApi(request, env, url) {
     const document = ruleSetDocumentFromInput(input, randomId(10));
     if (document.error) return jsonResponse(document, 422);
     const result = await callWorkspace(env, workspaceId, "create", { keyHash, document: document.value });
-    if (!result.error && result.ruleSet) await putPublishedRuleSet(env, workspaceId, result.ruleSet);
     return workspaceApiResponse(result, result.error ? undefined : 201, request);
   }
   const ruleSetId = parts[4] || "";
@@ -122,12 +122,10 @@ async function handleWorkspaceApi(request, env, url) {
       if (document.error) return jsonResponse(document, 422);
       const ifMatch = request.headers.get("if-match") || input.revision;
       const result = await callWorkspace(env, workspaceId, "save", { keyHash, document: document.value, ifMatch: Number(ifMatch) });
-      if (!result.error && result.ruleSet) await putPublishedRuleSet(env, workspaceId, result.ruleSet);
       return workspaceApiResponse(result, undefined, request);
     }
     if (request.method === "DELETE") {
       const result = await callWorkspace(env, workspaceId, "remove", { keyHash, ruleSetId });
-      if (!result.error) await deletePublishedRuleSet(env, workspaceId, ruleSetId);
       return workspaceApiResponse(result);
     }
   }
@@ -136,7 +134,9 @@ async function handleWorkspaceApi(request, env, url) {
 
 function workspaceApiResponse(result, successStatus = undefined, request = undefined) {
   if (result?.error) {
-    const status = result.error === "workspace_unauthorized" ? 401
+    const status = result.error === "workspace_storage_limit" ? 413
+      : result.error === "workspace_error" ? 500
+      : result.error === "workspace_unauthorized" ? 401
       : result.error === "ruleset_not_found" || result.error === "workspace_not_found" ? 404
         : result.error === "ruleset_conflict" ? 409 : 400;
     return jsonResponse(result, status);
@@ -152,13 +152,10 @@ async function handlePublishedRuleSet(request, env, url) {
   const [, , workspaceId, ruleSetId] = url.pathname.split("/");
   const cached = await getCachedPublishedRuleSet(request, env);
   if (cached) return cached;
-  let ruleSet = await getPublishedRuleSet(env, workspaceId, ruleSetId);
-  if (!ruleSet) {
-    const result = await callWorkspace(env, workspaceId, "public", { ruleSetId });
-    if (result.error || !result.ruleSet) return textResponse("Rule set not found", 404);
-    ruleSet = result.ruleSet;
-    await putPublishedRuleSet(env, workspaceId, ruleSet);
-  }
+  const result = await callWorkspace(env, workspaceId, "public", { ruleSetId });
+  if (result.error === "workspace_error") return textResponse("Workspace unavailable", 503);
+  if (result.error || !result.ruleSet) return textResponse("Rule set not found", 404);
+  const ruleSet = result.ruleSet;
   const etag = `"${workspaceId}-${ruleSetId}-${ruleSet.revision}"`;
   const headers = {
     "content-type": "text/plain; charset=utf-8",
@@ -256,32 +253,6 @@ function memoryWorkspaceBytes(state) {
 function memoryPublicRuleSet(state, ruleSetId) {
   const ruleSet = state.rulesets.find((item) => item.id === ruleSetId);
   return ruleSet ? { ruleSet: { id: ruleSet.id, name: ruleSet.name, revision: ruleSet.revision, updatedAt: ruleSet.updatedAt, content: ruleSet.content } } : { error: "ruleset_not_found" };
-}
-
-async function putPublishedRuleSet(env, workspaceId, ruleSet) {
-  const key = publishedRuleSetKey(workspaceId, ruleSet.id);
-  const value = JSON.stringify({ id: ruleSet.id, name: ruleSet.name, revision: ruleSet.revision, updatedAt: ruleSet.updatedAt, content: ruleSet.content });
-  memoryPublishedRuleSets.set(key, value);
-  if (env.CONVERTER_KV) await env.CONVERTER_KV.put(key, value);
-}
-
-async function getPublishedRuleSet(env, workspaceId, ruleSetId) {
-  const key = publishedRuleSetKey(workspaceId, ruleSetId);
-  const memory = memoryPublishedRuleSets.get(key);
-  if (memory) return JSON.parse(memory);
-  if (!env.CONVERTER_KV) return null;
-  const value = await env.CONVERTER_KV.get(key);
-  return value ? JSON.parse(value) : null;
-}
-
-async function deletePublishedRuleSet(env, workspaceId, ruleSetId) {
-  const key = publishedRuleSetKey(workspaceId, ruleSetId);
-  memoryPublishedRuleSets.delete(key);
-  if (env.CONVERTER_KV) await env.CONVERTER_KV.delete(key);
-}
-
-function publishedRuleSetKey(workspaceId, ruleSetId) {
-  return `published-ruleset:${workspaceId}:${ruleSetId}`;
 }
 
 async function getCachedPublishedRuleSet(request, env) {
@@ -895,17 +866,22 @@ async function handleRuleFetch(url, env) {
 }
 
 async function readInput(request) {
-  const type = request.headers.get("content-type") || "";
-  if (type.includes("application/json")) return request.json();
-  if (type.includes("application/x-www-form-urlencoded") || type.includes("multipart/form-data")) {
-    const form = await request.formData();
-    return {
-      name: String(form.get("name") || ""),
-      url: String(form.get("url") || ""),
-      source: String(form.get("source") || ""),
-    };
+  const bytes = await readBytes(request, 8 * 1024 * 1024);
+  const body = new Response(bytes, { headers: { "content-type": request.headers.get("content-type") || "text/plain" } });
+  const type = request.headers.get("content-type")?.split(";")[0].trim().toLowerCase() || "";
+  if (type === "application/json") {
+    const value = await body.json();
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new InputError(400, "invalid_payload");
+    for (const key of ["source", "url", "name", "iconUrl", "iconLightBase64"]) {
+      if (value[key] !== undefined && typeof value[key] !== "string") throw new InputError(400, "invalid_payload");
+    }
+    return value;
   }
-  return { source: await request.text() };
+  if (type === "application/x-www-form-urlencoded" || type === "multipart/form-data") {
+    const form = await body.formData();
+    return { name: String(form.get("name") || ""), url: String(form.get("url") || ""), source: String(form.get("source") || "") };
+  }
+  return { source: await body.text() };
 }
 
 async function resolveIconInput(input, env) {
@@ -936,90 +912,25 @@ async function fetchIconURL(rawUrl, env) {
   if (cached && cached.expiresAt > Date.now()) return { ...cached.value, source: "url" };
 
   const limit = maxIconBytes(env);
-  let lastFailure = "";
+  let lastFailure = "图片下载失败";
   for (const candidate of fetchURLCandidates(original)) {
-    let current = candidate;
-    for (let redirectCount = 0; redirectCount <= 5; redirectCount += 1) {
-      if (!isSafeRemoteURL(current)) {
-        lastFailure = "重定向目标不是公网 http/https URL。";
-        break;
-      }
-      let response;
-      try {
-        response = await fetch(current.toString(), {
-          headers: { "user-agent": "AnywhereModuleConverter/0.1", accept: "image/png,image/jpeg,image/webp,image/gif,image/*;q=0.8" },
-          redirect: "manual",
-        });
-      } catch (error) {
-        lastFailure = error?.message || "图片下载失败。";
-        break;
-      }
-      if (response.status >= 300 && response.status < 400) {
-        const location = response.headers.get("location");
-        if (!location || redirectCount === 5) {
-          lastFailure = redirectCount === 5 ? "图片重定向次数超过上限。" : "图片重定向缺少 Location。";
-          break;
-        }
-        try {
-          current = new URL(location, current);
-        } catch {
-          lastFailure = "图片重定向 URL 无法解析。";
-          break;
-        }
-        continue;
-      }
-      if (!response.ok) {
-        lastFailure = `HTTP ${response.status}`;
-        break;
-      }
-      const contentLength = Number(response.headers.get("content-length") || "0");
-      if (contentLength > limit) return { error: "icon_too_large", detail: `图片超过 ${limit} bytes 上限。`, status: 413 };
-      let bytes;
-      try {
-        bytes = await readBoundedBytes(response, limit);
-      } catch (error) {
-        return { error: "icon_too_large", detail: error?.message || `图片超过 ${limit} bytes 上限。`, status: 413 };
-      }
+    try {
+      const { bytes, finalUrl } = await fetchRemote(candidate, limit, "image/png,image/jpeg,image/webp,image/gif,image/*;q=0.8");
       const normalized = normalizeIconBase64(bytesToBase64(bytes), limit);
       if (normalized.error) return { error: "invalid_icon", detail: normalized.error, status: /超过/.test(normalized.error) ? 413 : 400 };
-      const value = { ...normalized, source: "url", url: original.toString(), finalUrl: current.toString() };
+      const value = { ...normalized, source: "url", url: original.toString(), finalUrl };
       memoryIconCache.set(original.toString(), { value, expiresAt: Date.now() + Math.max(60, fetchCacheTtl(env)) * 1000 });
       return value;
+    } catch (error) {
+      if (error instanceof InputError && error.status === 413) return { error: "icon_too_large", detail: `图片超过 ${limit} bytes 上限`, status: 413 };
+      lastFailure = "图片下载失败或重定向目标不受支持";
     }
   }
-  return { error: "icon_fetch_failed", detail: lastFailure || "图片下载失败。", status: 502 };
+  return { error: "icon_fetch_failed", detail: lastFailure, status: 502 };
 }
 
 function isSafeRemoteURL(url) {
   return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password && !isBlockedFetchHost(url.hostname);
-}
-
-async function readBoundedBytes(response, limit) {
-  if (!response.body?.getReader) {
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.length > limit) throw new Error(`图片超过 ${limit} bytes 上限。`);
-    return bytes;
-  }
-  const reader = response.body.getReader();
-  const chunks = [];
-  let total = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.length;
-    if (total > limit) {
-      await reader.cancel();
-      throw new Error(`图片超过 ${limit} bytes 上限。`);
-    }
-    chunks.push(value);
-  }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return bytes;
 }
 
 function bytesToBase64(bytes) {
@@ -1042,7 +953,7 @@ async function fetchSourceURL(rawUrl, env, byteLimit, options = {}) {
   if (!["http:", "https:"].includes(url.protocol)) {
     return { error: "bad_source_url", detail: "只允许 http/https URL。" };
   }
-  if (isBlockedFetchHost(url.hostname)) {
+  if (!isSafeRemoteURL(url)) {
     return { error: "blocked_source_url", detail: "不允许拉取 localhost、内网或链路本地地址。" };
   }
   const platformCache = options.cache !== "memory";
@@ -1052,32 +963,18 @@ async function fetchSourceURL(rawUrl, env, byteLimit, options = {}) {
     if (new TextEncoder().encode(cached).length > limit) return { error: "input_too_large", detail: "远程内容超过大小限制。", status: 413 };
     return { source: cached, url: url.toString(), cached: true };
   }
-  let response;
-  let lastFailure = "";
+  const limit = byteLimit || maxInputBytes(env);
   for (const candidate of fetchURLCandidates(url)) {
     try {
-      response = await fetch(candidate.toString(), {
-        headers: { "user-agent": "AnywhereModuleConverter/0.1" },
-        redirect: "follow",
-      });
+      const { bytes } = await fetchRemote(candidate, limit);
+      const source = new TextDecoder().decode(bytes);
+      await putCachedFetchSource(url.toString(), source, env, { platformCache });
+      return { source, url: url.toString() };
     } catch (error) {
-      lastFailure = error?.message || "fetch failed";
-      continue;
+      if (error instanceof InputError && error.status === 413) return { error: "input_too_large", detail: "远程内容超过大小限制", status: 413 };
     }
-    if (response.ok) break;
-    lastFailure = `HTTP ${response.status}`;
-    response = null;
   }
-  if (!response) {
-    return { error: "source_fetch_failed", detail: lastFailure || "fetch failed", status: 502 };
-  }
-  const limit = byteLimit || maxInputBytes(env);
-  const contentLength = Number(response.headers.get("content-length") || "0");
-  if (contentLength > limit) return { error: "input_too_large", detail: "远程模块超过大小限制。", status: 413 };
-  const source = await response.text();
-  if (new TextEncoder().encode(source).length > limit) return { error: "input_too_large", detail: "远程模块超过大小限制。", status: 413 };
-  await putCachedFetchSource(url.toString(), source, env, { platformCache });
-  return { source, url: url.toString() };
+  return { error: "source_fetch_failed", detail: "远程内容下载失败或重定向目标不受支持", status: 502 };
 }
 
 function fetchURLCandidates(url) {
@@ -1109,34 +1006,25 @@ async function rateLimit(request, env, scope) {
   const ip = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "local";
   const bucket = Math.floor(Date.now() / 60000);
   const identity = await sha256(`${scope}:${ip}`);
-  const key = `rate:${scope}:${bucket}:${identity}`;
-  const current = await getRateCount(env, key);
-  if (current >= limit) {
+  const key = `rate:${scope}:${identity}`;
+  let allowed;
+  if (env.RULESET_WORKSPACE) {
+    const result = await callWorkspace(env, key, "rate-limit", { bucket, limit });
+    if (typeof result.allowed !== "boolean") throw new Error("Rate limit unavailable");
+    allowed = result.allowed;
+  } else {
+    const item = memoryRateStore.get(key);
+    const count = item?.bucket === bucket ? item.count : 0;
+    allowed = count < limit;
+    if (allowed) memoryRateStore.set(key, { bucket, count: count + 1, expiresAt: (bucket + 1) * 60000 });
+  }
+  if (!allowed) {
     return jsonResponse({
       error: "rate_limited",
       detail: `请求过于频繁，请稍后再试。当前限制为每分钟 ${limit} 次。`,
     }, 429, { "retry-after": "60" });
   }
-  await putRateCount(env, key, current + 1);
   return null;
-}
-
-async function getRateCount(env, key) {
-  if (env.CONVERTER_KV) {
-    const value = await env.CONVERTER_KV.get(key);
-    return Number(value || 0) || 0;
-  }
-  const item = memoryRateStore.get(key);
-  if (!item || item.expiresAt < Date.now()) return 0;
-  return item.count;
-}
-
-async function putRateCount(env, key, count) {
-  if (env.CONVERTER_KV) {
-    await env.CONVERTER_KV.put(key, String(count), { expirationTtl: 90 });
-    return;
-  }
-  memoryRateStore.set(key, { count, expiresAt: Date.now() + 90 * 1000 });
 }
 
 async function getCachedFetchSource(url, env, options = {}) {
@@ -1166,26 +1054,9 @@ async function putCachedFetchSource(url, source, env, options = {}) {
   await caches.default.put(new Request(url, { method: "GET" }), response);
 }
 
-function isBlockedFetchHost(hostname) {
-  const host = hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
-  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return true;
-  const ipv4 = host.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
-  if (ipv4) {
-    const [a, b] = ipv4.slice(1, 3).map(Number);
-    if (a === 0 || a === 10 || a === 127 || a >= 224) return true;
-    if (a === 100 && b >= 64 && b <= 127) return true;
-    if (a === 169 && b === 254) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 192 && b === 168) return true;
-  }
-  if (host.startsWith("::ffff:")) return true;
-  if (host === "::1" || host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80:")) return true;
-  return false;
-}
-
 async function putFile(env, key, content) {
-  memoryStore.set(key, content);
   if (env.CONVERTER_KV) await env.CONVERTER_KV.put(key, content, { expirationTtl: 60 * 60 * 24 * 30 });
+  else memoryStore.set(key, content);
 }
 
 async function getFile(env, key) {
