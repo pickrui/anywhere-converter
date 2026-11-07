@@ -68,7 +68,7 @@ function loadScriptTextOverrides(args) {
 const args = parseArgs(process.argv.slice(2));
 const input = args.input || args._?.[0];
 if (!input) {
-  console.error("Usage: node bin/cli.mjs --input <module.plugin|sgmodule|ruleset.list> [--icon-file icon.png | --icon-url https://...] [--source-kind auto|module|ruleset] [--rule-set-routing default|direct|reject] [--out-dir ./out] [--json]");
+  console.error("Usage: node bin/cli.mjs --input <module.plugin|sgmodule|ruleset.list> [--icon-file icon.png | --icon-url https://...] [--source-kind auto|module|ruleset] [--output-format auto|amod|standalone] [--rule-set-routing default|direct|reject] [--out-dir ./out] [--json]");
   process.exit(2);
 }
 
@@ -123,8 +123,10 @@ async function readBoundedIconBytes(response, limit) {
 const source = fs.readFileSync(input, "utf8");
 const result = await convertAnyAsync(source, {
   name: args.name,
+  sourceUrl: args.sourceUrl,
   mode: args.mode,
   sourceKind: args.sourceKind,
+  outputFormat: args.outputFormat,
   ruleSetRouting: args.ruleSetRouting,
   arguments: parseArgumentOverrides(args),
   preserveParameters: args.preserveParameters === true || args.preserveParameters === "1" || args.preserveParameters === "true",

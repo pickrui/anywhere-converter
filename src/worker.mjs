@@ -26,7 +26,7 @@ export default {
       if (request.method === "GET" && url.pathname === "/health") return jsonResponse({
         ok: true,
         version: "0.1.0",
-        capabilities: ["url-input", "text-input", "custom-icon", "icon-url", "argument-form", "script-fetch", "script-recovery", "native-js-lift", "aggressive-js-lift", "ruleset-conversion", "dynamic-subscription", "cache-bust-refresh", "browser-download", "fallback-snapshot", "pwa", "ruleset-studio", "published-arrs", "workspace-key"],
+        capabilities: ["url-input", "text-input", "custom-icon", "icon-url", "argument-form", "script-fetch", "script-recovery", "native-js-lift", "amod-output", "ruleset-conversion", "dynamic-subscription", "cache-bust-refresh", "browser-download", "fallback-snapshot", "pwa", "ruleset-studio", "published-arrs", "workspace-key"],
       });
       if (request.method === "POST" && url.pathname === "/api/workspaces") {
         const limited = await rateLimit(request, env, "workspace-create");
@@ -258,7 +258,12 @@ function memoryPublicRuleSet(state, ruleSetId) {
 async function getCachedPublishedRuleSet(request, env) {
   const ttl = ruleSetCacheTtl(env);
   const cached = memoryPublicRuleSetCache.get(request.url);
-  if (cached && cached.expiresAt > Date.now()) return new Response(cached.body, { status: cached.status, headers: cached.headers });
+  if (cached && cached.expiresAt > Date.now()) {
+    const headers = { ...cached.headers, age: String(Math.max(0, Math.floor((Date.now() - cached.createdAt) / 1000))) };
+    return request.headers.get("if-none-match") === headers.etag
+      ? new Response(null, { status: 304, headers })
+      : new Response(cached.body, { status: cached.status, headers });
+  }
   if (ttl <= 0 || typeof caches === "undefined" || !caches.default) return null;
   return caches.default.match(request);
 }
@@ -267,7 +272,7 @@ async function putCachedPublishedRuleSet(request, response, env) {
   const ttl = ruleSetCacheTtl(env);
   if (ttl <= 0 || response.status !== 200) return;
   const body = await response.clone().text();
-  memoryPublicRuleSetCache.set(request.url, { body, status: response.status, headers: Object.fromEntries(response.headers.entries()), expiresAt: Date.now() + ttl * 1000 });
+  memoryPublicRuleSetCache.set(request.url, { body, status: response.status, headers: Object.fromEntries(response.headers.entries()), createdAt: Date.now(), expiresAt: Date.now() + ttl * 1000 });
   if (typeof caches !== "undefined" && caches.default) await caches.default.put(request, response);
 }
 
@@ -315,7 +320,7 @@ async function handleInspect(request, env) {
   }
 
   const sourceKind = normalizeInputSourceKind(input.sourceKind, input.source);
-  const parsed = sourceKind === "ruleset" ? parseRuleSet(input.source) : parseModule(input.source);
+  const parsed = sourceKind === "ruleset" ? parseRuleSet(input.source) : parseModule(input.source, { sourceUrl: input.sourceUrl || input.url });
   const argumentOverrides = isPlainObject(input.arguments) ? input.arguments : {};
   return jsonResponse({
     sourceKind,
@@ -357,9 +362,11 @@ async function handleConvert(request, env) {
   if (icon.error) return jsonResponse({ error: icon.error, detail: icon.detail }, icon.status || 400);
   const scriptTextByURL = normalizeScriptTextByURL(input.scriptTextByURL, env);
   const result = await convertAnyAsync(input.source, {
+    sourceUrl: input.sourceUrl || input.url,
     name: input.name,
     mode: input.mode,
     sourceKind: input.sourceKind,
+    outputFormat: input.outputFormat,
     ruleSetRouting: input.ruleSetRouting,
     arguments: isPlainObject(input.arguments) ? input.arguments : {},
     preserveParameters: truthyInput(input.preserveParameters),
@@ -422,7 +429,7 @@ async function handleConvert(request, env) {
   }
 
   const snapshotImportUrl = snapshotFiles.length
-    ? `anywhere://add-rule-set?${snapshotFiles.map((file) => `link=${encodeURIComponent(file.url)}`).join("&")}`
+    ? `anywhere://${result.files[0]?.type === "amod" ? "add-module" : "add-rule-set"}?${snapshotFiles.map((file) => `link=${encodeURIComponent(file.url)}`).join("&")}`
     : "";
   return jsonResponse({
     hash: snapshotHash || undefined,
@@ -458,6 +465,7 @@ function summarizeResult(result, files) {
     skipped: result.report.skipped,
     fileCount: files.length,
     ruleCount: files.reduce((sum, file) => sum + file.ruleCount, 0),
+    hostnameCount: result.hostnames?.length || 0,
     validationErrors: files.reduce((sum, file) => sum + file.validation.filter((item) => item.level === "error").length, 0),
     sampleRequired: result.report.status === "sample-required",
     sampleReasons: uniqueDiagnosticCodes(result.diagnostics.filter((item) => isSampleRequiredDiagnostic(item))),
@@ -482,7 +490,22 @@ async function handleDynamicRuleFetch(request, env) {
   const converted = await convertFromDynamicQuery(request, env);
   if (converted.error) return jsonResponse({ error: converted.error, detail: converted.detail }, converted.status || 400);
 
-  const file = selectDynamicFile(converted.result.files, kind);
+  const part = Number(url.searchParams.get("part") || 0);
+  if (!Number.isSafeInteger(part) || part < 0) return jsonResponse({ error: "bad_dynamic_part" }, 400);
+  const file = selectDynamicFile(converted.result.files, kind, part);
+  if (!file && kind === "module" && converted.result.diagnostics.some(item => item.code === "amod-budget-fallback")) {
+    const fallback = dynamicLinksForResult(request, converted.result, {
+      sourceUrl: converted.sourceUrl, name: converted.name, fetchScripts: converted.fetchScripts,
+      arguments: converted.arguments, sourceKind: converted.sourceKind, ruleSetRouting: converted.ruleSetRouting,
+      mode: converted.mode, preserveParameters: converted.preserveParameters, iconUrl: converted.iconUrl,
+      cacheBust: converted.cacheBust,
+    }, {});
+    return jsonResponse({ error: "module_limit_exceeded",
+      detail: "上游内容已超过 Anywhere 模块容量。本次未返回截断或空模块；请在转换器中重新转换并导入独立文件。Anywhere 会保留原有模块。",
+      diagnostics: converted.result.diagnostics.filter(item => item.code === "amod-budget-fallback"),
+      standaloneFiles: fallback.files, importUrl: fallback.importUrl,
+    }, 422, { "cache-control": "no-store" });
+  }
   if (!file) return textResponse(`Error: no ${kind} rules in module`, 404);
 
   const response = textResponse(file.content, 200, {
@@ -507,6 +530,7 @@ async function handleDynamicDeeplink(request, env) {
     arguments: converted.arguments,
     sourceKind: converted.sourceKind,
     ruleSetRouting: converted.ruleSetRouting,
+    outputFormat: converted.outputFormat,
     mode: converted.mode,
     preserveParameters: converted.preserveParameters,
     cacheBust: converted.cacheBust,
@@ -543,13 +567,20 @@ async function convertFromDynamicQuery(request, env) {
   const preserveParameters = truthyInput(url.searchParams.get("preserveParameters") || url.searchParams.get("preserveArguments"));
   const cacheBust = normalizeCacheBust(url.searchParams.get("cacheBust") || url.searchParams.get("_"));
   const iconUrl = String(url.searchParams.get("iconUrl") || "").trim();
+  // The concrete subscription path fixes its format. Keep all existing ARRS /
+  // AMRS URLs stable, including older fallback URLs carrying outputFormat=amod.
+  const kind = dynamicKindFromPath(url.pathname);
+  const outputFormat = kind === "module" ? "amod" : kind ? "standalone"
+    : url.searchParams.get("outputFormat") === "amod" ? "amod" : "standalone";
   const icon = iconUrl ? await fetchIconURL(iconUrl, env) : { base64: "", source: "none", url: "" };
   if (icon.error) return icon;
   const result = await convertAnyAsync(fetched.source, {
+    sourceUrl: fetched.url,
     name,
     mode,
     sourceKind,
     ruleSetRouting,
+    outputFormat,
     arguments: args,
     preserveParameters,
     iconLightBase64: icon.base64,
@@ -578,10 +609,12 @@ async function convertFromDynamicQuery(request, env) {
     preserveParameters,
     cacheBust,
     iconUrl: icon.url || iconUrl,
+    outputFormat,
   };
 }
 
 function dynamicKindFromPath(pathname) {
+  if (pathname.endsWith("/module.amod")) return "module";
   if (pathname.endsWith("/mitm.amrs")) return "mitm";
   if (pathname.endsWith("/reject.arrs")) return "reject";
   if (pathname.endsWith("/direct.arrs")) return "direct";
@@ -589,12 +622,13 @@ function dynamicKindFromPath(pathname) {
   return "";
 }
 
-function selectDynamicFile(files, kind) {
-  if (kind === "mitm") return files.find((file) => file.type === "amrs");
+function selectDynamicFile(files, kind, part = 0) {
+  if (kind === "module") return files.filter(file => file.type === "amod")[part];
+  if (kind === "mitm") return files.filter((file) => file.type === "amrs")[part];
   const arrs = files.filter((file) => file.type === "arrs");
-  if (kind === "reject") return arrs.find((file) => routingOfArrs(file.content) === 2);
-  if (kind === "direct") return arrs.find((file) => routingOfArrs(file.content) === 1);
-  if (kind === "rule") return arrs.find((file) => routingOfArrs(file.content) === 0) || arrs[0];
+  if (kind === "reject") return arrs.filter((file) => routingOfArrs(file.content) === 2)[part];
+  if (kind === "direct") return arrs.filter((file) => routingOfArrs(file.content) === 1)[part];
+  if (kind === "rule") { const defaults = arrs.filter(file => routingOfArrs(file.content) === 0); return (defaults.length ? defaults : arrs)[part]; }
   return null;
 }
 
@@ -611,21 +645,28 @@ function dynamicLinksForResult(request, result, input, scriptTextByURL) {
   const requestedKind = String(input.sourceKind || "").toLowerCase();
   const sourceKind = requestedKind && requestedKind !== "auto" ? requestedKind : result.sourceKind;
   const query = dynamicSearchParams(sourceUrl, input.name || "", input.arguments || {}, input.fetchScripts, input.mode, sourceKind, input.ruleSetRouting ?? result.ruleSetRouting, input.cacheBust, input.preserveParameters, input.iconUrl);
+  query.set("outputFormat", result.files[0]?.type === "amod" ? "amod" : "standalone");
   const files = [];
+  const parts = new Map();
   for (const file of result.files || []) {
     const path = dynamicPathForFile(file);
     if (!path) continue;
     const itemUrl = new URL(base.origin + path);
-    itemUrl.search = query.toString();
+    const part = parts.get(path) || 0;
+    parts.set(path, part + 1);
+    const fileQuery = new URLSearchParams(query);
+    if (result.files.filter(item => dynamicPathForFile(item) === path).length > 1) fileQuery.set("part", String(part));
+    itemUrl.search = fileQuery.toString();
     files.push({ name: file.name, type: file.type, ruleCount: file.ruleCount, url: itemUrl.toString() });
   }
   return {
     files,
-    importUrl: files.length ? `anywhere://add-rule-set?${files.map((file) => `link=${encodeURIComponent(file.url)}`).join("&")}` : "",
+    importUrl: files.length ? `anywhere://${result.files[0]?.type === "amod" ? "add-module" : "add-rule-set"}?${files.map((file) => `link=${encodeURIComponent(file.url)}`).join("&")}` : "",
   };
 }
 
 function dynamicPathForFile(file) {
+  if (file.type === "amod") return "/sub/module.amod";
   if (file.type === "amrs") return "/sub/mitm.amrs";
   if (file.type !== "arrs") return "";
   const routing = routingOfArrs(file.content);
@@ -844,17 +885,12 @@ function normalizeScriptTextByURL(value, env) {
   return out;
 }
 
-function scriptOverrideHash(value) {
-  if (!isPlainObject(value)) return "";
-  return JSON.stringify(Object.keys(value).sort().map((key) => [key, String(value[key] || "")]));
-}
-
 async function handleRuleFetch(url, env) {
   const match = url.pathname.match(/^\/r\/([^/]+)\/(.+)$/);
   if (!match) return jsonResponse({ error: "bad_rule_path" }, 400);
   const hash = match[1];
   const filename = decodeURIComponent(match[2]);
-  if (!/\.(amrs|arrs)$/i.test(filename)) return jsonResponse({ error: "bad_rule_extension" }, 400);
+  if (!/\.(amrs|arrs|amod)$/i.test(filename)) return jsonResponse({ error: "bad_rule_extension" }, 400);
   const content = await getFile(env, `${hash}/${filename}`);
   if (content == null) return jsonResponse({ error: "rule_not_found" }, 404);
   return new Response(content, {

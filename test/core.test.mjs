@@ -240,7 +240,7 @@ hostname = *.example.com, *api.example.com
   const result = convertModule(source);
   const amrs = result.files.find((file) => file.type === "amrs");
   assert.match(amrs.content, /hostname = example\.com/);
-  assert.match(amrs.content, /0, 0, \^https/);
+  assert.match(amrs.content, /0, 100, \^https/);
   assert.match(amrs.content, /1, 5, \^https/);
   assert.match(amrs.content, /api\.example\.com/);
   assert.deepEqual(validateAnywhereOutput(amrs), []);
@@ -327,8 +327,10 @@ test("converts surge dash rewrite syntax", () => {
 hostname = api.example.com
 `);
   const amrs = result.files.find((file) => file.type === "amrs");
-  assert.match(amrs.content, /0, 0, \^https/);
-  assert.match(amrs.content, /\{\}/);
+  assert.match(amrs.content, /0, 100, \^https/);
+  const source = Buffer.from(internals.parseCsv(amrs.content.split("\n").find(line => /^0, 100,/.test(line)))[3], "base64").toString();
+  assert.match(source, /application\/json/);
+  assert.match(source, /body: "\{\}"/);
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
 
@@ -478,7 +480,7 @@ hostname = api.example.com
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
 
-test("converts NetEase Cloud Music module with parameter preservation as a golden case", async () => {
+test("NetEase parameter-format golden uses a synthetic argument reader, not real script behavior", async () => {
   const source = String.raw`
 #!name= 网易云音乐去广告
 #!arguments= 隐藏底部标签开关↓:--,发现:0,漫游:1,笔记:0,关注:1,搜索:1,首页自定义名称:0,我的自定义名称:0,漫游自定义名称:0,笔记自定义名称:0,发现自定义名称:0,隐藏顶部标签开关↓:--,心动:1,播客:1,听书:1,活动Tab:0,隐藏首页卡片开关↓:--,问候语:0,每日推荐:0,推荐歌单:0,最近常听:0,音乐合伙人:0,雷达歌单:1,排行榜:0,推荐专属歌单:0,你的专属歌单:1,私房推荐歌曲:1,红心相似歌曲:1
@@ -1161,10 +1163,10 @@ hostname = api.example.com
   assert.match(wrapped, /function __atobShim/);
   assert.match(wrapped, /function __fetch/);
   assert.match(wrapped, /var __cryptoShim/);
-  assert.match(wrapped, /"setTimeout", "clearTimeout", "setInterval", "clearInterval"/);
-  assert.match(wrapped, /"URL", "URLSearchParams"/);
-  assert.match(wrapped, /"TextEncoder", "TextDecoder", "atob", "btoa"/);
-  assert.match(wrapped, /"fetch", "crypto"/);
+  assert.match(wrapped, /setTimeout, clearTimeout, setInterval, clearInterval/);
+  assert.match(wrapped, /URL, URLSearchParams/);
+  assert.match(wrapped, /TextEncoder, TextDecoder, atob, btoa/);
+  assert.match(wrapped, /fetch, crypto/);
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
 
@@ -1215,7 +1217,7 @@ hostname = api.example.com
   const amrs = result.files.find((file) => file.type === "amrs");
   const line = amrs.content.split("\n").find((item) => item.startsWith("1, 100,"));
   const wrapped = Buffer.from(internals.parseCsv(line)[3], "base64").toString("utf8");
-  assert.match(wrapped, /var \$argument = "\[true,false\]"/);
+  assert.match(wrapped, /\$response, \$done, "\[true,false\]"\)/);
   assert.deepEqual(internals.parseKeyValueTokens("argument=[true,false], requires-body=true"), {
     argument: "[true,false]",
     "requires-body": "true",
@@ -1267,7 +1269,7 @@ hostname = api.example.com
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
 
-test("lifts simple JSON mutation scripts to native body-json", async () => {
+test("preserves complete JS for: lifts simple JSON mutation scripts to native body-json", async () => {
   const source = `
 #!name = JS Lift JSON Mini
 [Script]
@@ -1284,17 +1286,13 @@ obj.data.vip = true;
 $done({ body: JSON.stringify(obj) });
 `,
   });
-  const amrs = result.files.find((file) => file.type === "amrs");
-  const lines = amrs.content.split("\n").filter((line) => line.startsWith("1, 5,"));
-  assert.equal(lines.length, 2);
-  assert.deepEqual(internals.parseCsv(lines[0]).slice(3), ["delete", "$.data.ad"]);
-  assert.deepEqual(internals.parseCsv(lines[1]).slice(3), ["replace", "$.data.vip", "true"]);
-  assert(!amrs.content.includes("1, 100,"));
-  assert(result.diagnostics.some((item) => item.code === "script-native-lift"));
+  const amrs = result.files.find(file => file.type === "amrs");
+  assert(amrs.content.includes("1, 100,"));
+  assert(!result.diagnostics.some(d => d.code === "script-native-lift"));
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
 
-test("lifts JSON mutation scripts with literal constants", async () => {
+test("preserves complete JS for: lifts JSON mutation scripts with literal constants", async () => {
   const source = `
 #!name = JS Lift JSON Constants Mini
 [Script]
@@ -1313,18 +1311,13 @@ obj.data.enabled = OFF;
 $done({ body: JSON.stringify(obj) });
 `,
   });
-  const amrs = result.files.find((file) => file.type === "amrs");
-  const bodyJsonLines = amrs.content.split("\n").filter((item) => item.startsWith("1, 5,"));
-  assert.equal(bodyJsonLines.length, 2);
-  const fields = bodyJsonLines.map((line) => internals.parseCsv(line).slice(3));
-  assert(fields.some((item) => item[0] === "replace" && item[1] === "$.data.ads" && item[2] === "[]"));
-  assert(fields.some((item) => item[0] === "replace" && item[1] === "$.data.enabled" && item[2] === "false"));
-  assert(!amrs.content.includes("new Function"));
-  assert(result.diagnostics.some((item) => item.code === "script-native-lift"));
+  const amrs = result.files.find(file => file.type === "amrs");
+  assert(amrs.content.includes("1, 100,"));
+  assert(!result.diagnostics.some(d => d.code === "script-native-lift"));
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
 
-test("lifts simple response body replace scripts to native body-replace", async () => {
+test("preserves complete JS for: lifts simple response body replace scripts to native body-replace", async () => {
   const source = `
 #!name = JS Lift Replace Mini
 [Script]
@@ -1339,14 +1332,13 @@ $response.body = $response.body.replace(/"ads":\\[.+?\\]/g, '"ads":[]');
 $done({ body: $response.body });
 `,
   });
-  const amrs = result.files.find((file) => file.type === "amrs");
-  const line = amrs.content.split("\n").find((item) => item.startsWith("1, 4,"));
-  assert.deepEqual(internals.parseCsv(line).slice(3), ['"ads":\\[.+?\\]', '"ads":[]']);
-  assert(result.diagnostics.some((item) => item.code === "script-native-lift"));
+  const amrs = result.files.find(file => file.type === "amrs");
+  assert(amrs.content.includes("1, 100,"));
+  assert(!result.diagnostics.some(d => d.code === "script-native-lift"));
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
 
-test("lifts simple array filter scripts to native body-json", async () => {
+test("preserves complete JS for: lifts simple array filter scripts to native body-json", async () => {
   const source = `
 #!name = JS Lift Filter Mini
 [Script]
@@ -1362,14 +1354,13 @@ obj.data.items = obj.data.items.filter(item => item.type !== "ad");
 $done({ body: JSON.stringify(obj) });
 `,
   });
-  const amrs = result.files.find((file) => file.type === "amrs");
-  const line = amrs.content.split("\n").find((item) => item.startsWith("1, 5,"));
-  assert.deepEqual(internals.parseCsv(line).slice(3), ["remove-where-field-in", "$.data.items", "type", "[\"ad\"]"]);
-  assert(result.diagnostics.some((item) => item.code === "script-native-lift"));
+  const amrs = result.files.find(file => file.type === "amrs");
+  assert(amrs.content.includes("1, 100,"));
+  assert(!result.diagnostics.some(d => d.code === "script-native-lift"));
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
 
-test("lifts guarded JSON scripts with request url and response body aliases", async () => {
+test("preserves complete JS for: lifts guarded JSON scripts with request url and response body aliases", async () => {
   const source = `
 #!name = JS Lift Alias Mini
 [Script]
@@ -1390,19 +1381,13 @@ if (url.includes("/feed")) {
 $done({ body: JSON.stringify(obj) });
 `,
   });
-  const amrs = result.files.find((file) => file.type === "amrs");
-  const bodyJsonLines = amrs.content.split("\n").filter((line) => line.startsWith("1, 5,"));
-  assert.equal(bodyJsonLines.length, 2);
-  const fields = bodyJsonLines.map((line) => internals.parseCsv(line).slice(3));
-  assert.deepEqual(fields, [
-    ["remove-where-field-in", "$.data.rows", "model_type", "[\"ads\"]"],
-    ["delete", "$.data.banner"],
-  ]);
-  assert(result.diagnostics.some((item) => item.code === "script-native-lift"));
+  const amrs = result.files.find(file => file.type === "amrs");
+  assert(amrs.content.includes("1, 100,"));
+  assert(!result.diagnostics.some(d => d.code === "script-native-lift"));
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
 
-test("does not lift unrelated guarded URL branches onto concrete patterns", async () => {
+test("preserves complete JS for: does not lift unrelated guarded URL branches onto concrete patterns", async () => {
   const source = `
 #!name = JS Lift Branch Overlap Mini
 [Script]
@@ -1424,14 +1409,13 @@ if (url.includes("/vip")) {
 $done({ body: JSON.stringify(obj) });
 `,
   });
-  const amrs = result.files.find((file) => file.type === "amrs");
-  const bodyJsonLines = amrs.content.split("\n").filter((line) => line.startsWith("1, 5,"));
-  assert.equal(bodyJsonLines.length, 1);
-  assert.deepEqual(internals.parseCsv(bodyJsonLines[0]).slice(3), ["delete", "$.data.banner"]);
+  const amrs = result.files.find(file => file.type === "amrs");
+  assert(amrs.content.includes("1, 100,"));
+  assert(!result.diagnostics.some(d => d.code === "script-native-lift"));
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
 
-test("lifts guarded existence deletes without lifting conditional assignments", async () => {
+test("preserves complete JS for: lifts guarded existence deletes without lifting conditional assignments", async () => {
   const source = `
 #!name = JS Lift Guarded Delete Mini
 [Script]
@@ -1458,17 +1442,13 @@ if (url.includes("/util/update") && obj.data) {
 $done({ body: JSON.stringify(obj) });
 `,
   });
-  const amrs = result.files.find((file) => file.type === "amrs");
-  const bodyJsonLines = amrs.content.split("\n").filter((line) => line.startsWith("1, 5,"));
-  const fields = bodyJsonLines.map((line) => internals.parseCsv(line).slice(3));
-  assert.deepEqual(fields, [
-    ["delete", "$.data.ad_black_list"],
-    ["delete", "$.data.operation_float"],
-  ]);
+  const amrs = result.files.find(file => file.type === "amrs");
+  assert(amrs.content.includes("1, 100,"));
+  assert(!result.diagnostics.some(d => d.code === "script-native-lift"));
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
 
-test("compat mode lifts statically guarded JSON branch mutations", async () => {
+test("preserves complete JS for: compat mode lifts statically guarded JSON branch mutations", async () => {
   const source = `
 #!name = JS Guarded Branch Mini
 [Script]
@@ -1489,20 +1469,13 @@ $done({ body: JSON.stringify(obj) });
     mode: "compat",
     fetchText: async () => script,
   });
-  const compatAmrs = compat.files.find((file) => file.type === "amrs");
-  const bodyJsonLines = compatAmrs.content.split("\n").filter((item) => item.startsWith("1, 5,"));
-  assert.equal(bodyJsonLines.length, 2);
-  const fields = bodyJsonLines.map((line) => internals.parseCsv(line));
-  assert(fields.every((item) => item[2].includes("(?=.*(?:/feed))")));
-  assert(fields.some((item) => item[3] === "replace" && item[4] === "$.data.ads" && item[5] === "[]"));
-  assert(fields.some((item) => item[3] === "delete" && item[4] === "$.data.banner"));
-  assert(!compatAmrs.content.includes("1, 100,"));
-  assert(compat.diagnostics.some((item) => item.code === "script-native-lift"));
-  assert(!compat.diagnostics.some((item) => item.code === "script-aggressive-native-lift"));
-  assert.deepEqual(validateAnywhereOutput(compatAmrs), []);
+  const amrs = compat.files.find(file => file.type === "amrs");
+  assert(amrs.content.includes("1, 100,"));
+  assert(!compat.diagnostics.some(d => d.code === "script-native-lift"));
+  assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
 
-test("aggressive mode lifts array splice clears", async () => {
+test("preserves complete JS for: aggressive mode lifts array splice clears", async () => {
   const source = `
 #!name = JS Aggressive Splice Mini
 [Script]
@@ -1530,15 +1503,12 @@ $done({ body: JSON.stringify(obj) });
     fetchText: async () => script,
   });
   const aggressiveAmrs = aggressive.files.find((file) => file.type === "amrs");
-  const line = aggressiveAmrs.content.split("\n").find((item) => item.startsWith("1, 5,"));
-  assert.deepEqual(internals.parseCsv(line).slice(3), ["replace", "$.data.items", "[]"]);
-  assert(!aggressiveAmrs.content.includes("1, 100,"));
-  assert(aggressive.diagnostics.some((item) => item.code === "aggressive-mode"));
-  assert(aggressive.diagnostics.some((item) => item.code === "script-aggressive-native-lift"));
+  assert(aggressiveAmrs.content.includes("1, 100,"));
+  assert(!aggressive.diagnostics.some(d => d.code === "script-aggressive-native-lift"));
   assert.deepEqual(validateAnywhereOutput(aggressiveAmrs), []);
 });
 
-test("lifts multiple exact filter exclusions to native body-json", async () => {
+test("preserves complete JS for: lifts multiple exact filter exclusions to native body-json", async () => {
   const source = `
 #!name = JS Lift Multi Filter Mini
 [Script]
@@ -1555,15 +1525,13 @@ $response.body = JSON.stringify(obj);
 $done({});
 `,
   });
-  const amrs = result.files.find((file) => file.type === "amrs");
-  const line = amrs.content.split("\n").find((item) => item.startsWith("1, 5,"));
-  assert.deepEqual(internals.parseCsv(line).slice(3), ["remove-where-field-in", "$.data.items", "type", "[\"ad\",\"sponsor\"]"]);
-  assert(!amrs.content.includes("1, 100,"));
-  assert(result.diagnostics.some((item) => item.code === "script-native-lift"));
+  const amrs = result.files.find(file => file.type === "amrs");
+  assert(amrs.content.includes("1, 100,"));
+  assert(!result.diagnostics.some(d => d.code === "script-native-lift"));
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
 
-test("lifts trivial recursive delete walkers to native body-json", async () => {
+test("preserves complete JS for: lifts trivial recursive delete walkers to native body-json", async () => {
   const source = `
 #!name = JS Lift Recursive Delete Mini
 [Script]
@@ -1585,14 +1553,9 @@ walk(obj);
 $done({ body: JSON.stringify(obj) });
 `,
   });
-  const amrs = result.files.find((file) => file.type === "amrs");
-  const bodyJsonLines = amrs.content.split("\n").filter((item) => item.startsWith("1, 5,"));
-  assert.equal(bodyJsonLines.length, 2);
-  const fields = bodyJsonLines.map((line) => internals.parseCsv(line).slice(3));
-  assert(fields.some((item) => item[0] === "delete-recursive" && item[1] === "ad"));
-  assert(fields.some((item) => item[0] === "delete-recursive" && item[1] === "promo"));
-  assert(!amrs.content.includes("new Function"));
-  assert(result.diagnostics.some((item) => item.code === "script-native-lift"));
+  const amrs = result.files.find(file => file.type === "amrs");
+  assert(amrs.content.includes("1, 100,"));
+  assert(!result.diagnostics.some(d => d.code === "script-native-lift"));
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
 
@@ -1620,7 +1583,7 @@ $done($request);
   const amrs = result.files.find((file) => file.type === "amrs");
   const lines = amrs.content.split("\n");
   assert(lines.some((line) => line.includes(", 0, ^https://api") && line.includes("https://api.example.com/new")));
-  assert(lines.some((line) => line.includes("0, 3,") && line.includes("x-test, 1")));
+  assert(lines.some((line) => line.includes("0, 1,") && line.includes("x-test, 1")));
   assert(lines.some((line) => line.includes("0, 2,") && line.includes("if-none-match")));
   assert(!amrs.content.includes("new Function"));
   assert(result.diagnostics.some((item) => item.code === "script-request-lift"));
@@ -1646,14 +1609,14 @@ $done($request);
   const amrs = result.files.find((file) => file.type === "amrs");
   const lines = amrs.content.split("\n");
   assert(lines.some((line) => line.includes(", 0, ^https://old") && line.includes("https://new.example.com/api/$1")));
-  assert(lines.some((line) => line.includes("0, 3,") && line.includes("x-test, 1")));
-  assert(lines.some((line) => line.includes("0, 3,") && line.includes("cache-control, no-cache")));
+  assert(lines.some((line) => line.includes("0, 1,") && line.includes("x-test, 1")));
+  assert(lines.some((line) => line.includes("0, 1,") && line.includes("cache-control, no-cache")));
   assert(!amrs.content.includes("new Function"));
   assert(result.diagnostics.some((item) => item.code === "script-request-lift"));
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
 
-test("lifts static request done object mutations", async () => {
+test("blocks whole request header object replacement that cannot remove unknown incoming fields", async () => {
   const source = `
 #!name = Request Done Object Lift Mini
 [Script]
@@ -1671,14 +1634,9 @@ $done({
 });
 `,
   });
-  const amrs = result.files.find((file) => file.type === "amrs");
-  const lines = amrs.content.split("\n");
-  assert(lines.some((line) => line.includes(", 0, ^https://api") && line.includes("https://api.example.com/new")));
-  assert(lines.some((line) => line.includes("0, 3,") && line.includes("x-test, 1")));
-  assert(lines.some((line) => line.includes("0, 3,") && line.includes("cache-control, no-cache")));
-  assert(!amrs.content.includes("new Function"));
-  assert(result.diagnostics.some((item) => item.code === "script-request-lift"));
-  assert.deepEqual(validateAnywhereOutput(amrs), []);
+  assert.equal(result.files.length, 0);
+  assert(!result.diagnostics.some(item => item.code === "script-request-lift"));
+  assert(result.diagnostics.some(item => item.code === "request-mutation-script"));
 });
 
 test("lifts fixed request response scripts to lightweight respond script", async () => {
@@ -1781,7 +1739,7 @@ setTimeout(() => $done({ body: $response.body }), 200);
   const line = amrs.content.split("\n").find((item) => item.startsWith("1, 100,"));
   const wrapped = Buffer.from(internals.parseCsv(line)[3], "base64").toString("utf8");
   assert.match(wrapped, /__setTimeout\(resolve, 10000\)/);
-  assert.match(wrapped, /globalThis\.setTimeout = __setTimeout/);
+  assert.match(wrapped, /__installGlobal\("setTimeout", __setTimeout\)/);
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });
 
@@ -1804,11 +1762,9 @@ $done($response);
   const amrs = result.files.find((file) => file.type === "amrs");
   const line = amrs.content.split("\n").find((item) => item.startsWith("1, 100,"));
   const wrapped = Buffer.from(internals.parseCsv(line)[3], "base64").toString("utf8");
-  assert.match(wrapped, /var __binaryBodyMode = true/);
-  assert.match(wrapped, /body: __binaryBodyMode \? __bodyBytes : __bodyText/);
-  assert.match(wrapped, /var __responseGrowthCapBytes = 65535/);
-  assert.match(wrapped, /__originalBodyLength >= 0/);
-  assert.match(wrapped, /__setBodyIfWithinCap\(__bodyOut\(\$response\.body\)\)/);
+  assert.match(wrapped, /if \(true\).*new Uint8Array\(ctx.body/);
+  assert.match(wrapped, /next.length > ctx.body.length \+ 65535/);
+  assert.match(wrapped, /ctx.body = next/);
   assert(result.diagnostics.some((item) => item.code === "script-binary-sample-required"));
   assert.deepEqual(validateAnywhereOutput(amrs), []);
 });

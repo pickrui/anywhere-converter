@@ -7,12 +7,15 @@ The converter is split into small runtime-neutral entry points instead of a mono
 | File | Role |
 | --- | --- |
 | `src/core.mjs` | Parser, normalization, rule mapping, emitter, validator, script wrapper. |
+| `src/loon.mjs` | Loon 3.5.1 syntax tokenizer/parser, typed binding, native mapping and guarded scripts. |
 | `bin/cli.mjs` | Local command-line entry point. |
 | `src/worker.mjs` | Cloudflare Worker API, source fetching, KV persistence, rule serving. |
 | `src/ui.mjs` | Worker browser UI rendering. |
 | `test/core.test.mjs` | Node test suite for parser/emitter/mapping behavior. |
 
 ## Pipeline
+
+Loon v2 items bypass legacy text substitution and bind plugin values to parsed nodes. No `eval` or generated configuration reparse is used. Only static single-URL conditions with compatible actions lift to native rules. Conditional JSON uses `Anywhere.json`; unsupported readonly-header operations reject the complete source line. When v2 HTTP scripts occur, all HTTP Script items in that module participate in a shared first-complete-match selector per phase, while Rewrite scripts remain independent. Same-source sharing never merges away the selector or different arguments. Cross Rewrite/Script ordering still requires a sample; see [Loon support](loon-compatibility.md).
 
 ```mermaid
 flowchart LR
@@ -62,3 +65,9 @@ These links preserve the original module or rule-set URL in the subscription, so
 ## Script Cost Metrics
 
 Conversion reports include `scriptRuleCount`, `totalScriptBytes`, and `maxPerHitScriptBytes`. The last value is the most relevant hot-path number because Anywhere compiles the selected script source for every invocation and executes at most one buffered script per message. Native-only outputs report zero script bytes.
+
+As of 2026-10-10, complete AST validation gates JavaScript lifts. Static runners share source across parameter variants; body-only scripts use a smaller adapter and decode text lazily. Dispatcher parts are awaited sequentially. Acorn is bundled into the Worker, not downloaded by the browser.
+
+As of 2026-10-16, `qx.mjs` parses QX rewrite actions and extracts self-identifying rewrite metadata from actual JS comments. Both enter the existing module pipeline and share its resource budgets. Section names are case-insensitive. Do not globally deduplicate ordered mutations: repeated native deletes/adds may be required. The response adapter rejects unavailable original-request fields instead of substituting response data. AMOD also preserves upstream `description`/`desc` metadata.
+
+`outputFormat=auto` (also omitted/empty) bundles plugins as AMOD and leaves plain rule sets standalone. Explicit `amod` / `standalone` override this choice. `convertModule` / `convertRuleSet` remain low-level standalone producers. Budget estimation projects native Codable fields, counting UTF-8 and slash escaping, plus a 4096-byte reserve for subscription metadata and ordinary parameter overrides. It is not an upper bound for arbitrarily long user edits; the app's final validation remains authoritative. Excessive budgets preserve all standalone files. Dynamic split subscriptions use a zero-based `part` query parameter; concrete AMRS/ARRS paths always remain standalone, while module paths always request AMOD. Existing module subscriptions that exceed capacity return HTTP 422 with standalone alternatives, never partial/empty successful modules. Published Rule Studio memory copies expire; HTTP caching cannot extend their remaining freshness window. See [module output](module-output.md).

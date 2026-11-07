@@ -505,6 +505,7 @@ export function renderHome() {
     .status.sample-required { background: var(--violet); color: white; }
     .status.blocked { background: var(--red); color: white; }
     .chips, .files { display: flex; gap: 8px; flex-wrap: wrap; min-height: 30px; align-items: center; }
+    .module-notice { flex-basis: 100%; margin: 4px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
     .chip {
       border: 1px solid var(--line);
       border-radius: 999px;
@@ -884,7 +885,7 @@ export function renderHome() {
         <img class="brand-mark" src="/icons/anywhere-converter-app-icon-v2-512.png" width="44" height="44" alt="">
         <div>
           <h1>Anywhere Converter</h1>
-          <p class="subtitle">把 Loon / Surge 插件、模块、脚本和规则集，转化为轻量、可导入的 Anywhere 配置。</p>
+          <p class="subtitle">将 Loon / Surge 插件、QX Rewrite、脚本和规则集，转换为 Anywhere 规则或模块。</p>
         </div>
       </div>
       <div class="header-actions">
@@ -901,7 +902,7 @@ export function renderHome() {
     <main class="workspace">
       <section class="panel converter-panel" aria-labelledby="input-title">
         <div class="panel-head">
-          <div class="converter-panel-title"><h2 class="panel-title" id="input-title">转换器</h2><small>导入 Loon / Surge 插件、模块或规则集</small></div>
+          <div class="converter-panel-title"><h2 class="panel-title" id="input-title">转换器</h2><small>导入插件、模块、QX Rewrite / JS 或规则集</small></div>
           <div class="actions">
             <button class="btn" id="sample" type="button" title="填入一个最小示例模块">${icon("file-plus")}示例</button>
             <button class="btn" id="clear" type="button" title="清空输入">${icon("trash")}清空</button>
@@ -914,8 +915,8 @@ export function renderHome() {
               <label>模块 / 规则集 URL
                 <input name="url" inputmode="url" autocomplete="url" placeholder="https://example.com/module.plugin">
               </label>
-              <label class="converter-source-text">插件 / 模块 / 规则集内容
-                <textarea name="source" spellcheck="false" placeholder="粘贴 Loon / Surge 插件、模块或规则集内容。只填写 URL 时，会自动读取远程内容。"></textarea>
+              <label class="converter-source-text">插件 / Rewrite / JS / 规则集内容
+                <textarea name="source" spellcheck="false" placeholder="粘贴插件、模块、QX Rewrite、带 QX 规则注释的 JS 或规则集。仅填写 URL 时自动读取；无匹配范围的独立 JS 需配套 rewrite。"></textarea>
               </label>
             </section>
             <details class="converter-options">
@@ -928,7 +929,7 @@ export function renderHome() {
                   <label>输入类型
                     <select name="sourceKind">
                       <option value="auto">自动识别</option>
-                      <option value="module">插件/模块</option>
+                      <option value="module">插件 / 模块 / Rewrite / JS</option>
                       <option value="ruleset">规则集</option>
                     </select>
                   </label>
@@ -940,11 +941,19 @@ export function renderHome() {
                     </select>
                   </label>
                 </div>
+            <label>输出格式
+              <select name="outputFormat">
+                <option value="auto">自动 · 插件生成 AMOD，规则集生成 ARRS</option>
+                <option value="standalone">独立 AMRS / ARRS</option>
+                <option value="amod">Anywhere 模块 AMOD（2.4+）</option>
+              </select>
+              <small>AMOD 支持统一订阅与参数配置，需要 Anywhere 2.4+；超出容量时保留完整独立文件。</small>
+            </label>
             <details class="icon-config" id="icon-config">
               <summary>
                 <span class="icon-summary-copy">
                   <strong>自定义图标（可选）</strong>
-                  <small>上传图片或导入 URL，自动嵌入所有生成的 AMRS / ARRS。</small>
+                  <small>上传图片或导入 URL，自动嵌入生成的模块或规则集。</small>
                 </span>
                 <span class="icon-summary-state" id="icon-summary-state">未设置</span>
               </summary>
@@ -1005,10 +1014,10 @@ export function renderHome() {
               </span>
             </label>
             <label class="switchline">
-              <input type="checkbox" name="aggressive" value="true">
+              <input type="checkbox" checked disabled>
               <span class="switch-copy">
-                <span>增强 JS 原生化</span>
-                <small>尝试提升更多静态 JSON 清理脚本；二进制、动态逻辑仍会保留或标记需验证。</small>
+                <span>安全 JS 原生化（自动）</span>
+                <small>完整脚本能表达为原生规则时自动转换；复杂条件、过滤和二进制保留 JS，不猜测行为。</small>
               </span>
             </label>
             <div class="script-recovery">
@@ -1107,7 +1116,7 @@ export function renderHome() {
             <div class="studio-icon-preview" id="studio-icon-preview"><img id="studio-icon-image" alt="规则集图标预览" hidden><span id="studio-icon-placeholder">图标</span></div>
             <div class="studio-icon-copy">
               <h4 id="studio-icon-title">自定义图标</h4>
-              <p>上传图片或读取图片 URL 后，会作为 Base64 写入 <code>icon-light</code>，随规则集一起保存和发布。</p>
+              <p>图标随规则集一起保存和发布，编码不会显示在下方规则编辑框中。</p>
               <div class="studio-icon-actions"><label class="btn" for="studio-icon-file">选择图片<input id="studio-icon-file" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden></label><button class="btn" id="studio-icon-remove" type="button" hidden>移除图标</button></div>
               <div class="studio-icon-url-row"><input id="studio-icon-url" type="url" inputmode="url" autocomplete="url" placeholder="https://example.com/icon.png" aria-label="规则集图标 URL"><button class="btn" id="studio-icon-load-url" type="button">读取 URL</button></div>
               <small id="studio-icon-status">支持 PNG、JPEG、WebP、GIF，最大 256 KiB。</small>
@@ -1304,7 +1313,7 @@ $done({ body: JSON.stringify(obj) });\`;
       clearRemoteSourceIfUrlChanged();
     });
 
-    for (const control of form.querySelectorAll('input[name="fetchScripts"], input[name="aggressive"], input[name="preserveParameters"], select[name="sourceKind"], select[name="ruleSetRouting"]')) {
+    for (const control of form.querySelectorAll('input[name="fetchScripts"], input[name="aggressive"], input[name="preserveParameters"], select[name="sourceKind"], select[name="ruleSetRouting"], select[name="outputFormat"]')) {
       control.addEventListener("change", () => scheduleReconvert());
     }
 
@@ -1418,6 +1427,7 @@ $done({ body: JSON.stringify(obj) });\`;
             url: raw.url || "",
             source,
             sourceKind: raw.sourceKind || "auto",
+            outputFormat: raw.outputFormat || "auto",
             ruleSetRouting: raw.ruleSetRouting || "default",
             mode: raw.aggressive === "true" ? "aggressive" : "compat",
             arguments: argumentOverrides,
@@ -1606,6 +1616,8 @@ $done({ body: JSON.stringify(obj) });\`;
       if (json.icon?.source === "url") appendSignal("URL 图标 · 动态可用");
       if ((json.dynamicFiles || []).some((file) => /[?&]cacheBust=/.test(file.url || ""))) appendSignal("已刷新缓存");
       if (json.sourceKind === "ruleset") appendSignal("规则集");
+      if ((json.files || []).some(file => file.type === "amod")) appendSignal("AMOD 模块 · Anywhere 2.4+");
+      if (json.hostnames?.length) appendSignal("MITM 域名 " + json.hostnames.length);
       if (summary.validationErrors) appendSignal("验证错误 " + summary.validationErrors);
       if ((json.preservedParameters || []).length) appendSignal("参数保留 " + json.preservedParameters.length);
       if (summary.nativeLiftCount) appendSignal("JS 原生化 " + summary.nativeLiftCount);
@@ -1641,6 +1653,12 @@ $done({ body: JSON.stringify(obj) });\`;
         filesEl.append(link);
       }
       renderConversionExplanation(json);
+      if ((json.files || []).some(file => file.type === "amod")) {
+        const notice = document.createElement("p");
+        notice.className = "module-notice";
+        notice.textContent = "模块统一管理相关规则和参数。若之前导入过同一插件的独立 AMRS / ARRS，请确认模块后停用重复项；相同条件下独立规则优先。";
+        filesEl.append(notice);
+      }
       renderDiagnostics(json);
 
       if (json.importUrl) {
@@ -1976,6 +1994,14 @@ $done({ body: JSON.stringify(obj) });\`;
 
     function signalLabel(code) {
       const labels = {
+        "loon-v2-invalid": "Loon 新语法无效",
+        "loon-rewrite-unsupported": "Loon Rewrite 需处理",
+        "loon-script-unsupported": "Loon Script 需处理",
+        "loon-trigger-unsupported": "不支持任务触发器",
+        "loon-order-sample-required": "Loon 混合执行顺序需验证",
+        "reject-connection-sample-required": "裸 reject 为近似响应 · 需验证",
+        "jq-assignment-parent-sample-required": "嵌套 jq 赋值需验证",
+        "amod-budget-fallback": "模块超限 · 已保留独立文件",
         "script-binary-sample-required": "二进制脚本需验证",
         "script-dynamic-sample-required": "动态脚本需验证",
         "sample-required-pattern": "高风险路径需验证",
@@ -2014,6 +2040,15 @@ $done({ body: JSON.stringify(obj) });\`;
         "logical-and-degraded": "组合条件已放宽",
         "cross-host-transparent-rewrite": "跨域透明改写",
         "complex-hostname-wildcard": "复杂 hostname 已跳过",
+        "hostname-wildcard-expanded": "hostname 范围已放宽",
+        "mitm-hostname-missing": "缺少 MITM hostname",
+        "script-metadata-required": "JS 需要配套规则",
+        "script-request-context-sample-required": "原始请求数据不可用",
+        "qx-response-head-unsupported": "响应头需人工转换",
+        "qx-local-script": "QX 本地脚本需补全",
+        "qx-rewrite-unsupported": "QX 动作暂不支持",
+        "qx-reject-not-equivalent": "QX reject 无等价映射",
+        "qx-section-unsupported": "不转换远程引用或任务",
         "map-local-script-response": "Map Local 保留响应信息",
         "map-local-native-trivial-header": "Map Local 已原生化",
         "unknown-header": "未知规则头",
@@ -2368,6 +2403,7 @@ $done({ body: JSON.stringify(obj) });\`;
     let studioKey = workspaceKeyFromFragment() || (studioWorkspaceId ? localStorage.getItem("anywhere-converter-workspace-key:" + studioWorkspaceId) : "");
     let studioWorkspace = null;
     let studioRuleSet = null;
+    let studioIconValue = "";
     let studioDraftTimer = 0;
 
     document.querySelectorAll("[data-app-view]").forEach((button) => button.addEventListener("click", () => setAppView(button.dataset.appView)));
@@ -2539,6 +2575,7 @@ $done({ body: JSON.stringify(obj) });\`;
       studioEditorTitle.textContent = studioRuleSet.name || "规则集";
       studioName.value = studioRuleSet.name || "";
       studioRouting.value = String(studioRuleSet.routing || 0);
+      studioIconValue = "";
       studioSource.value = studioRuleSet.content || "";
       renderStudioIconPreview();
       studioSummary.textContent = (studioRuleSet.ruleCount || 0).toLocaleString() + " 条 · " + formatStudioBytes(studioRuleSet.bytes || 0) + " · v" + (studioRuleSet.revision || 1);
@@ -2558,7 +2595,7 @@ $done({ body: JSON.stringify(obj) });\`;
         const response = await studioFetch("/api/workspaces/" + studioWorkspaceId + "/rulesets/" + studioRuleSet.id, {
           method: "PUT",
           headers: { "content-type": "application/json", "if-match": String(studioRuleSet.revision || 1) },
-          body: JSON.stringify({ name: studioName.value, routing: Number(studioRouting.value), source: studioSource.value, revision: studioRuleSet.revision }),
+          body: JSON.stringify({ name: studioName.value, routing: Number(studioRouting.value), source: studioFullSource(), revision: studioRuleSet.revision }),
         });
         const data = await readStudioResponse(response);
         if (response.status === 409) throw new Error("此规则集已在另一处被更新，请重新打开后合并修改。");
@@ -2642,12 +2679,17 @@ $done({ body: JSON.stringify(obj) });\`;
       }
     }
 
+    function studioFullSource() {
+      const lines = studioSource.value.split("\\n");
+      if (studioIconValue) {
+        const routingIndex = lines.findIndex((line) => /^\\s*routing\\s*=/i.test(line));
+        lines.splice(routingIndex >= 0 ? routingIndex + 1 : 0, 0, "icon-light = " + studioIconValue);
+      }
+      return lines.join("\\n");
+    }
+
     function writeStudioIcon(base64) {
-      const lines = studioSource.value.split("\\n").filter((line) => !/^\\s*icon-light\\s*=/i.test(line));
-      const routingIndex = lines.findIndex((line) => /^\\s*routing\\s*=/i.test(line));
-      const index = routingIndex >= 0 ? routingIndex + 1 : Math.min(lines.length, 2);
-      lines.splice(index, 0, "icon-light = " + base64);
-      studioSource.value = lines.join("\\n").replace(/\\n{3,}/g, "\\n\\n");
+      studioIconValue = base64;
       renderStudioIconPreview();
       scheduleStudioDraft();
     }
@@ -2655,6 +2697,7 @@ $done({ body: JSON.stringify(obj) });\`;
     function removeStudioIcon() {
       const lines = studioSource.value.split("\\n").filter((line) => !/^\\s*icon-light\\s*=/i.test(line));
       studioSource.value = lines.join("\\n").replace(/\\n{3,}/g, "\\n\\n");
+      studioIconValue = "";
       studioIconFile.value = "";
       studioIconUrl.value = "";
       renderStudioIconPreview();
@@ -2664,7 +2707,11 @@ $done({ body: JSON.stringify(obj) });\`;
 
     function renderStudioIconPreview() {
       const match = studioSource.value.match(/^\\s*icon-light\\s*=\\s*(.+)\\s*$/im);
-      const raw = match?.[1]?.trim() || "";
+      if (match) {
+        studioIconValue = match[1].trim();
+        studioSource.value = studioSource.value.split("\\n").filter((line) => !/^\\s*icon-light\\s*=/i.test(line)).join("\\n");
+      }
+      const raw = studioIconValue;
       if (!raw) {
         studioIconImage.removeAttribute("src");
         studioIconImage.hidden = true;
@@ -2755,7 +2802,7 @@ $done({ body: JSON.stringify(obj) });\`;
       if (!studioRuleSet) return;
       clearTimeout(studioDraftTimer);
       studioDraftTimer = setTimeout(async () => {
-        await writeStudioDraft(studioRuleSet.id, { name: studioName.value, routing: Number(studioRouting.value), content: studioSource.value, updatedAt: Date.now() });
+        await writeStudioDraft(studioRuleSet.id, { name: studioName.value, routing: Number(studioRouting.value), content: studioFullSource(), updatedAt: Date.now() });
         studioStatusText("草稿已保存在此设备，尚未发布。", false);
       }, 450);
     }
@@ -2809,7 +2856,7 @@ export function renderManifest() {
   return JSON.stringify({
     name: "Anywhere Converter",
     short_name: "Anywhere",
-    description: "Loon / Surge 到 Anywhere 的转换器与规则集在线工坊",
+    description: "Loon / Surge / QX 到 Anywhere 的转换器与规则集在线工坊",
     start_url: "/",
     display: "standalone",
     background_color: "#f4f6fb",
@@ -2823,7 +2870,7 @@ export function renderManifest() {
 }
 
 export function renderServiceWorker() {
-  return `const CACHE = "anywhere-converter-shell-v3";
+  return `const CACHE = "anywhere-converter-shell-v8";
 const ASSETS = ["/", "/manifest.webmanifest", "/icons/anywhere-converter-app-icon-v2-180.png", "/icons/anywhere-converter-app-icon-v2-192.png", "/icons/anywhere-converter-app-icon-v2-512.png"];
 self.addEventListener("install", (event) => event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(ASSETS)).then(() => self.skipWaiting())));
 self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));

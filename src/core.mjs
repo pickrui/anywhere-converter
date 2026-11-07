@@ -1,3 +1,8 @@
+import { liftResponseScript, liftRequestStatic, parseScript } from "./js-lift.mjs";
+import { packageAmod, splitAmod, moduleBudget } from "./amod.mjs";
+import { normalizeSection, parseQXRewrite, scriptCommentConfig } from "./qx.mjs";
+import { isLoonV2, parseLoonV2, prepareLoonScript, convertLoonRewrite } from "./loon.mjs";
+
 const ROUTING = {
   default: 0,
   direct: 1,
@@ -52,8 +57,9 @@ export function convertModule(source, options = {}) {
   const preserveParameters = shouldPreserveParameters(options);
   const referencedArguments = preserveParameters ? collectReferencedArguments(parsed.items) : new Set();
   const parameterState = preserveParameters ? amrsParameterStateFromArguments(parsed.arguments, argumentValues, diagnostics, { referencedArguments }) : { parameters: [], nameMap: {} };
+  const loonFirstMatch = parsed.items.some(item => item.section === "Script" && item.loonV2);
   if (mode === "aggressive") {
-    diagnostics.push({ level: "warning", code: "aggressive-mode", message: "aggressive 模式是实验入口；protobuf/binary/复杂脚本仍需样本验证。", line: 0, source: "" });
+    diagnostics.push({ level: "warning", code: "aggressive-mode", message: "旧 aggressive 参数仍兼容，但不再启用未经完整证明的 JSON 提升；当前采用与 compat 相同的安全策略。", line: 0, source: "" });
   }
   let mitmRules = [];
   const routingGroups = new Map();
@@ -81,7 +87,7 @@ export function convertModule(source, options = {}) {
     mitmRules.push(rule);
     converted += 1;
     if (rule.degraded) addDiagnostic("warning", rule.degraded.code, rule.degraded.message, line, sourceLine);
-    const sourceHosts = extractHostsFromPattern(rule.pattern);
+    const sourceHosts = uniqueStrings([extractHostsFromPattern(rule.pattern), ...(rule.loonHostPatterns || []).map(extractHostsFromPattern)].flat());
     for (const host of sourceHosts) inferredHosts.add(host);
     const targetHost = transparentRewriteTargetHost(rule);
     if (targetHost && !sourceHosts.includes(targetHost) && !crossHostRewriteTargets.has(targetHost)) {
@@ -138,7 +144,10 @@ export function convertModule(source, options = {}) {
     }
     case "Rewrite":
     case "URL Rewrite": {
-      const mapped = convertRewriteLine(item);
+      const legacyLoon = !item.loonV2 && legacyLoonRewrite(item.text);
+      const mapped = item.loonV2 || legacyLoon
+        ? convertLoonRewrite(item.loonV2 || legacyLoon, parsed.arguments, argumentValues, { ...options, preserveParameters, parameterNameMap: parameterState.nameMap, base64 }, jqToBodyJson)
+        : convertRewriteLine(item);
       if (mapped?.kind === "skip") {
         skipped += 1;
         addDiagnostic(mapped.level || "warning", mapped.code, mapped.message, item.line, item.raw);
@@ -187,7 +196,13 @@ export function convertModule(source, options = {}) {
       break;
     }
     case "Script": {
-      const mapped = convertScriptLine(item, { ...options, mode, argumentValues, parameterNameMap: parameterState.nameMap });
+      const loonScript = item.loonV2 && prepareLoonScript(item.loonV2, parsed.arguments, argumentValues, { ...options, preserveParameters, parameterNameMap: parameterState.nameMap });
+      const mapped = loonScript?.error ? { code: loonScript.error, message: loonScript.message }
+        : convertScriptLine(loonScript ? { ...item, script: loonScript } : item, { ...options, mode, argumentValues, parameterNameMap: parameterState.nameMap, ...(loonFirstMatch ? { jsLift: false } : {}) });
+      if (loonFirstMatch && mapped?.rule && !Array.isArray(mapped.rule)) {
+        mapped.rule.loonHTTP = true;
+        mapped.rule.loonGuard = loonScript?.loonGuard || "true";
+      }
       if (mapped?.rule) {
         addMitmMapped(mapped.rule, item.line, item.raw);
         for (const diagnostic of mapped.diagnostics || []) {
@@ -195,26 +210,36 @@ export function convertModule(source, options = {}) {
         }
       } else {
         skipped += 1;
-        addDiagnostic("info", mapped?.code || "script-skipped", mapped?.message || "脚本规则已识别；当前未下载远程脚本，启用 fetchScripts 后可用兼容层保留。", item.line, item.raw);
+        addDiagnostic(mapped?.code?.startsWith("loon-") ? "warning" : "info", mapped?.code || "script-skipped", mapped?.message || "脚本规则已识别；当前未下载远程脚本，启用 fetchScripts 后可用兼容层保留。", item.line, item.raw);
       }
       break;
     }
     default:
+      if (/^task(?:_|$)|^rewrite_remote$/i.test(item.section)) {
+        skipped += 1;
+        addDiagnostic("warning", "qx-section-unsupported", "不转换远程 rewrite 引用或定时任务，请直接提供 rewrite 内容；不会执行任务脚本。", item.line, item.raw);
+      }
       break;
     }
+  }
+
+  if (loonFirstMatch && parsed.items.some(item => ["Rewrite", "URL Rewrite", "Body Rewrite", "Header Rewrite", "Map Local"].includes(item.section))) {
+    addDiagnostic("warning", "loon-order-sample-required", "Loon 的 Rewrite/Script 禁用关系及原始响应条件快照与 Anywhere 的分阶段处理不同；混用模块需实机核对，不能承诺整体执行顺序等价。");
   }
 
   const name = options.name || parsed.metadata.name || "Converted Module";
   let hostnames = normalizeHostnames([...parsed.hostnames, ...inferredHosts], diagnostics);
   hostnames = applyVerifiedRecipe(name, hostnames, mitmRules);
   mitmRules = generalizeGroupedHostPatterns(mitmRules, hostnames, diagnostics);
-  mitmRules = dedupeMitmRules(mitmRules);
+  // Ordered mutations are not a set: repeated delete/add operations may be
+  // essential after an intervening mutation. Generated preprocessing is merged separately.
   mitmRules = mergeSameGateScripts(mitmRules, diagnostics);
   mitmRules = mergeIdenticalScriptSourcesByPhase(mitmRules, diagnostics);
   mitmRules = mergeScriptDispatchersByPhase(mitmRules, diagnostics);
   mitmRules = mergeGeneratedHeaderPreprocessRules(mitmRules, diagnostics);
   const parameters = parameterState.parameters;
   const files = [];
+  if (mitmRules.length && !hostnames.length) diagnostics.push({ level: "warning", code: "mitm-hostname-missing", message: "存在 MITM 规则但没有有效 hostname，URL 也无法安全推导；这些规则不会自动接管任何主机，请补充 hostname。", line: 0, source: "" });
 
   if (mitmRules.length) {
     files.push({
@@ -266,7 +291,7 @@ export async function convertModuleAsync(source, options = {}) {
       const resolvedItem = resolveItemArguments(originalItem, argumentValues);
       if (!resolvedItem.enabled) continue;
       const item = resolvedItem.item;
-      const script = parseScriptLine(item.text);
+      const script = item.loonV2 ? prepareLoonScript(item.loonV2, parsed.arguments, argumentValues, { ...options, preserveParameters: shouldPreserveParameters(options) }) : item.script || parseScriptLine(item.text);
       if (!script?.path || script.inlineScript || attemptedScriptURLs.has(script.path)) continue;
       attemptedScriptURLs.add(script.path);
       if (scriptFetchAttempts >= scriptFetchLimit) {
@@ -391,7 +416,8 @@ export async function convertModuleAsync(source, options = {}) {
 
 export function detectSourceKind(source) {
   const text = String(source || "");
-  if (/\[(?:Rewrite|URL Rewrite|MITM|Script|Map Local|Body Rewrite|Header Rewrite|Arguments?)\]/i.test(text)) return "module";
+  if (/\[(?:Rewrite|rewrite_local|filter_local|URL Rewrite|MITM|Script|Map Local|Body Rewrite|Header Rewrite|Arguments?)\]/i.test(text)) return "module";
+  if (/^\s*(?:hostname\s*=|\S+\s+url\s+\S+)/im.test(text)) return "module";
   if (/^\s*\[Rule\]\s*$/im.test(text)) return "module";
 
   let ruleLike = 0;
@@ -409,17 +435,23 @@ export function detectSourceKind(source) {
 
 export function convertAny(source, options = {}) {
   const sourceKind = normalizeSourceKind(options.sourceKind, source);
-  if (sourceKind === "ruleset") return convertRuleSet(source, options);
+  if (sourceKind === "ruleset") return finalizeOutput(convertRuleSet(source, options), options);
   const result = convertModule(source, options);
   result.sourceKind = "module";
-  return result;
+  return finalizeOutput(result, options);
 }
 
 export async function convertAnyAsync(source, options = {}) {
   const sourceKind = normalizeSourceKind(options.sourceKind, source);
-  if (sourceKind === "ruleset") return convertRuleSet(source, options);
+  if (sourceKind === "ruleset") return finalizeOutput(convertRuleSet(source, options), options);
   const result = await convertModuleAsync(source, options);
   result.sourceKind = "module";
+  return finalizeOutput(result, options);
+}
+
+function finalizeOutput(result, options) {
+  packageAmod(result, options);
+  result.report = buildReport({ ...result.report, files: result.files, diagnostics: result.diagnostics });
   return result;
 }
 
@@ -475,7 +507,7 @@ export function convertRuleSet(source, options = {}) {
 
   const name = options.name || parsed.metadata.name || "Converted Rule Set";
   const hostnames = normalizeHostnames([...inferredHosts], diagnostics);
-  mitmRules = dedupeMitmRules(mitmRules);
+  if (mitmRules.length && !hostnames.length) diagnostics.push({ level: "warning", code: "mitm-hostname-missing", message: "存在 MITM 规则但没有有效 hostname，URL 也无法安全推导；请补充 hostname。", line: 0, source: "" });
   const files = [];
   if (mitmRules.length) {
     files.push({
@@ -545,14 +577,15 @@ function parseArgumentLine(line, rawLine = "", lineNumber = 0) {
   const fields = parseCsv(split[1]);
   const type = String(fields[0] || "string").trim().toLowerCase();
   const knownType = /^(?:switch|input|text|string|number|select|checkbox)$/i.test(type);
-  const defaultValue = knownType ? (fields[1] ?? "") : (fields[0] ?? "");
+  const hasDefaultValue = fields.length > 1 && !/^(?:tag|desc|description|type)\s*=/i.test(fields[1]);
+  const defaultValue = knownType ? (hasDefaultValue ? fields[1] : "") : (fields[0] ?? "");
   const meta = {};
   const optionFields = [];
   for (const field of fields.slice(knownType ? 1 : 0)) {
     const pair = splitFirst(String(field || ""), "=");
     if (pair) {
       const key = pair[0].trim().toLowerCase();
-      if (key === "tag" || key === "desc" || key === "description") {
+      if (key === "tag" || key === "desc" || key === "description" || key === "type") {
         meta[key === "description" ? "desc" : key] = pair[1].trim();
       }
       continue;
@@ -570,6 +603,8 @@ function parseArgumentLine(line, rawLine = "", lineNumber = 0) {
   return {
     name,
     type: knownType ? type : "string",
+    ...(meta.type ? { valueType: meta.type } : {}),
+    hasDefaultValue,
     defaultValue: normalizeArgumentValueForType(defaultValue, knownType ? type : "string"),
     options,
     tag: meta.tag || "",
@@ -807,7 +842,10 @@ function resolveArgumentValues(argumentDefinitions = {}, overrides = {}) {
 }
 
 function resolveItemArguments(item, argumentValues) {
-  const enableMatch = item.text.match(/\benable\s*=\s*(?:\{([A-Za-z_][A-Za-z0-9_-]*)\}|([A-Za-z_][A-Za-z0-9_-]*|true|false|1|0))/i);
+  // New Loon values are typed AST data; text substitution would allow syntax
+  // injection and a second interpolation pass.
+  if (item.loonV2) return { enabled: true, item };
+  const enableMatch = item.text.match(/\benabled?\s*=\s*(?:\{([A-Za-z_][A-Za-z0-9_-]*)\}|([A-Za-z_][A-Za-z0-9_-]*|true|false|1|0))/i);
   if (enableMatch) {
     const key = enableMatch[1] || enableMatch[2];
     const value = Object.prototype.hasOwnProperty.call(argumentValues, key) ? argumentValues[key] : key;
@@ -854,7 +892,9 @@ function argumentEnabled(value) {
   return /^(?:true|1|yes|on)$/i.test(String(value || "").trim());
 }
 
-export function parseModule(source) {
+export function parseModule(source, options = {}) {
+  const embeddedScript = scriptCommentConfig(String(source), options);
+  if (embeddedScript) return embeddedScript;
   const metadata = {};
   const diagnostics = [];
   const hostnames = [];
@@ -874,22 +914,41 @@ export function parseModule(source) {
       if (split) metadata[split[0].trim().toLowerCase()] = split[1].trim();
       return;
     }
-    if (raw.startsWith("#") || raw.startsWith("//")) return;
+    if (/^\/\/\s*@ScriptName\s+/.test(raw)) metadata.name ||= raw.replace(/^\/\/\s*@ScriptName\s+/, "").trim();
+    if (raw.startsWith("#") || raw.startsWith("//") || raw.startsWith(";")) return;
 
     const sectionMatch = raw.match(/^\[([^\]]+)\]$/);
     if (sectionMatch) {
-      section = sectionMatch[1].trim();
+      section = normalizeSection(sectionMatch[1]);
       return;
     }
 
-    const line = stripInlineComment(raw).trim();
+    const line = isLoonV2(raw) ? raw : stripInlineComment(raw).trim();
     if (!line) return;
 
-    if (section === "MITM") {
+    if ((["Rewrite", "URL Rewrite", "Script"].includes(section) || !section) && isLoonV2(line)) {
+      const script = section === "Script" || !section && /\bthen\s+script\(/.test(line);
+      const loonV2 = parseLoonV2(line, script);
+      items.push({ section: script ? "Script" : "Rewrite", text: line, raw: rawLine, line: lineNumber, loonV2 });
+      return;
+    }
+
+    if (section === "MITM" || !section && /^hostname\s*=/i.test(line)) {
       const split = splitFirst(line, "=");
       if (split && split[0].trim().toLowerCase() === "hostname") {
         hostnames.push(...split[1].split(",").map((item) => item.trim()).filter(Boolean));
       }
+      return;
+    }
+
+    const qx = (section === "Rewrite" || section === "URL Rewrite" || !section) && parseQXRewrite(line);
+    if (qx) {
+      if (qx.error) diagnostics.push({ level: "warning", code: qx.error, message: qx.message, line: lineNumber, source: rawLine });
+      else items.push({ ...qx, text: qx.text || line, raw: rawLine, line: lineNumber });
+      return;
+    }
+    if (!section && /^(?:host|domain|ip(?:6)?-cidr)(?:-suffix|-keyword)?\s*,/i.test(line)) {
+      items.push({ section: "Rule", text: line, raw: rawLine, line: lineNumber });
       return;
     }
 
@@ -1057,6 +1116,15 @@ function chunkRules(rules, maxRules) {
 }
 
 export function validateAnywhereOutput(file) {
+  if (file.type === "amod" || file.name?.endsWith(".amod")) {
+    const diagnostics = moduleBudget(file.content).errors.map(message => ({ level: "error", code: "amod-limit", message }));
+    for (const section of splitAmod(file.content)) {
+      if (section.type === "module") continue;
+      const type = section.type === "mitm" ? "amrs" : "arrs";
+      diagnostics.push(...validateAnywhereOutput({ type, content: section.content }));
+    }
+    return diagnostics;
+  }
   const diagnostics = [];
   const lines = String(file.content || "").replace(/\r\n?/g, "\n").split("\n");
   const isAmrs = file.name?.endsWith(".amrs") || file.type === "amrs";
@@ -1226,7 +1294,35 @@ function normalizeLogicalAndUrlPattern(pattern) {
   return pattern;
 }
 
+function legacyLoonRewrite(text) {
+  const parts = splitCommand(text), action = parts[1] || "";
+  const header = /^(response-)?header-(add|replace|del|replace-regex)$/.exec(action);
+  // Existing JSON/jq handlers also support generated filters; leave those on
+  // their established path instead of narrowing them to the new native subset.
+  if (!header) return null;
+  const phase = header[1] ? 1 : 0;
+  const method = ({add:"add",replace:"set",del:"del","replace-regex":"replace"})[header[2]];
+  const size = method === "del" ? 1 : method === "replace" ? 3 : 2;
+  const args = parts.slice(2), actions = [];
+  if (!args.length || args.length % size) return { error: "loon-legacy-invalid", message: "旧 Loon 批量参数数量不完整。" };
+  for (let i = 0; i < args.length; i += size) {
+    const values = args.slice(i, i + size).map((value, j) => {
+      if (method === "replace" && j === 1) return { kind: "regex", pattern: value, flags: "" };
+      return { kind: "literal", value: value.replace(/\\x20/g, " ") };
+    });
+    actions.push({name: `${phase ? "response" : "request"}.header.${method}`, args: values});
+  }
+  return { phase, condition: {kind:"compare",left:{kind:"variable",name:"url"},op:"regex",right:{kind:"regex",pattern:parts[0],flags:""}}, actions, options:{}, script:false };
+}
+
 function convertRewriteLine(item) {
+  if (item.bodyReplace) return { phase: item.bodyReplace.phase, op: 4, pattern: urlGate(item.pattern), fields: [item.bodyReplace.search, item.bodyReplace.replacement] };
+  if (item.dialect === "quantumult-x") {
+    if (item.action === "reject") return { kind: "skip", code: "qx-reject-not-equivalent", message: "QX reject 的连接/响应语义不能用 Anywhere 200 空响应冒充，请选择明确的 reject-200 等动作或人工处理。" };
+    if (["reject-dict", "reject-array"].includes(item.action)) return mapLocalRespondScriptRule(item.pattern, { status: 200, dataType: "json", data: item.action === "reject-dict" ? "{}" : "[]" });
+    if (["301", "303", "307", "308"].includes(item.action)) return /^https?:\/\//i.test(item.value) ? requestCaptureRedirectScriptRule(item.pattern, item.value, Number(item.action)) : null;
+    if (["reject-200", "reject-img"].includes(item.action)) return rejectRule(item.pattern, item.action === "reject-img" ? { kind: "gif" } : { kind: "text", value: "" });
+  }
   const rawRewrite = parseRewriteCommand(item.text);
   if (rawRewrite?.action === "response-body-replace-regex") {
     return bodyReplaceRule(1, rawRewrite.pattern, splitBodyReplaceParts(rawRewrite.rest));
@@ -1476,7 +1572,7 @@ function convertHeaderRewriteLine(item) {
 }
 
 function convertScriptLine(item, options) {
-  const parsed = parseScriptLine(item.text);
+  const parsed = item.script || parseScriptLine(item.text);
   if (!parsed) return null;
   if (shouldPreserveParameters(options) && item.originalText) {
     const originalParsed = parseScriptLine(item.originalText);
@@ -1493,8 +1589,9 @@ function convertScriptLine(item, options) {
     if (status) return { code: status.code, message: status.message || "脚本没有可用 source；请补全脚本文本。" };
     return { code: "script-source-missing", message: "脚本没有可用 source；请开启脚本下载或提供 scriptTextByURL。" };
   }
+  if (!parseScript(source)) return { code: "script-syntax-invalid", message: "脚本无法解析，未生成会导致整个 dispatcher 编译失败的代码。" };
   if (options.jsLift !== false) {
-    const requestLift = liftRequestMutationScript(source, parsed);
+    const requestLift = liftRequestStatic(source, parsed, FRAMING_HEADERS);
     if (requestLift.length) {
       diagnostics.push({ level: "info", code: "script-request-lift", message: `已将 ${requestLift.length} 个静态 request mutation 提升为 Anywhere 原生请求规则。` });
       return { rule: requestLift.map((rule) => ({ ...rule, pattern: urlGate(parsed.pattern) })), diagnostics };
@@ -1514,22 +1611,11 @@ function convertScriptLine(item, options) {
   const hardBlock = diagnostics.find((diagnostic) => diagnostic.level === "error");
   if (hardBlock) return { code: hardBlock.code, message: hardBlock.message };
   if (options.jsLift !== false) {
-    const lifted = liftScriptToNativeRules(source, parsed);
+    const lifted = liftResponseScript(source, parsed);
     if (lifted.length) {
       diagnostics.push({ level: "info", code: "script-native-lift", message: `已将 ${lifted.length} 个简单 JS body 操作提升为 Anywhere 原生规则；未执行任意 JS 语义猜测。` });
+      if (lifted.some(rule => rule.op === 5)) diagnostics.push({ level: "warning", code: "script-native-json-sample-required", message: "JSON 操作使用原生对象语义；大整数精度、无变更时原文保留及序列化格式可能与 JS stringify 不同，请验证响应样本。" });
       return { rule: lifted.map((rule) => ({ ...rule, pattern: urlGate(parsed.pattern) })), diagnostics };
-    }
-    const guardedLifted = liftGuardedJsonBranchRules(source, parsed, { aggressive: false });
-    if (guardedLifted.length) {
-      diagnostics.push({ level: "info", code: "script-native-lift", message: `已将 ${guardedLifted.length} 个 URL 分支内静态 JSON 操作提升为 Anywhere 原生规则；未执行任意 JS 语义猜测。` });
-      return { rule: guardedLifted, diagnostics };
-    }
-    if (options.mode === "aggressive") {
-      const aggressiveLifted = liftAggressiveScriptToNativeRules(source, parsed);
-      if (aggressiveLifted.length) {
-        diagnostics.push({ level: "info", code: "script-aggressive-native-lift", message: `aggressive 模式已将 ${aggressiveLifted.length} 个 URL 分支内静态 JSON 操作提升为 Anywhere 原生规则。` });
-        return { rule: aggressiveLifted, diagnostics };
-      }
     }
     const respond = liftRequestRespondScript(source, parsed);
     if (respond) {
@@ -1543,7 +1629,7 @@ function convertScriptLine(item, options) {
   const wrapped = wrapLoonSurgeScript(source, parsed);
   diagnostics.push({ level: "warning", code: "script-compat-layer", message: "脚本已用轻量 Loon/Surge 兼容层包装；复杂网络请求、二进制/protobuf 或平台 API 仍需实机验证。" });
   return {
-    rule: { phase: parsed.phase, op: 100, pattern: urlGate(parsed.pattern), fields: [base64(wrapped)], scriptSource: wrapped, requiresBody: parsed.requiresBody },
+    rule: { phase: parsed.phase, op: 100, pattern: parsed.loonHTTP ? parsed.pattern : urlGate(parsed.pattern), fields: [base64(wrapped)], scriptSource: wrapped, requiresBody: parsed.requiresBody, ...(parsed.loonHostPatterns ? { loonHostPatterns: parsed.loonHostPatterns, loonV2: true } : {}) },
     diagnostics,
   };
 }
@@ -1636,10 +1722,31 @@ function scanScriptRisk(source, parsed, rawLine) {
     diagnostics.push({ level: "warning", code: "script-node-require-branch", message: "脚本包含 require 调用；常见 Env 模板的 Node.js 分支可保留，但需实机验证未执行该分支。" });
   }
   const codeWithoutStrings = stripJsStrings(stripJsComments(source));
+  if (parsed.phase === 1 && /\$request\s*(?:\.\s*(?:headers|bodyBytes|body)\b|\[\s*["'](?:headers|bodyBytes|body)["']\s*\])/.test(source)) diagnostics.push({ level: "warning", code: "script-request-context-sample-required", message: "Anywhere 响应阶段只提供响应头与响应正文，不提供原始请求头/正文。读取这些 $request 字段时会报错透传，不能拿响应数据冒充；需人工适配。" });
+  if (parsed.dialect === "quantumult-x" && parsed.phase === 1) {
+    let unsupportedHead = false;
+    function inspect(node) {
+      if (!node || typeof node !== "object") return;
+      if (node.type === "CallExpression" && node.callee?.name === "$done" && node.arguments[0]?.type === "ObjectExpression") unsupportedHead ||= node.arguments[0].properties.some(p => p.type === "Property" && ["headers", "status", "statusCode"].includes(p.key.name ?? p.key.value));
+      if (/\$response\.(?:headers|status|statusCode)/.test(codeWithoutStrings) && (node.type === "AssignmentExpression" || node.type === "UpdateExpression" || node.type === "UnaryExpression" && node.operator === "delete")) {
+        const target = node.left || node.argument;
+        const left = source.slice(target.start, target.end);
+        unsupportedHead ||= /^\$response\.(?:headers|status|statusCode)(?:\b|\[)/.test(left);
+      }
+      for (const value of Object.values(node)) if (Array.isArray(value)) value.forEach(inspect); else if (value && typeof value === "object") inspect(value);
+    }
+    inspect(parseScript(source));
+    if (unsupportedHead) diagnostics.push({ level: "error", code: "qx-response-head-unsupported", message: "QX 响应脚本修改 headers/status，但 Anywhere ctx head 为只读；不能只保留 body 后宣称转换完整，请人工转换为原生头规则。" });
+  }
+  if (/\b(?:URL|URLSearchParams)\b/.test(codeWithoutStrings)) diagnostics.push({ level: "warning", code: "script-url-api-sample-required", message: "URL/searchParams 使用常用 HTTP(S) 兼容子集，不是完整 WHATWG URL；复杂地址和不支持的 API 需样本验证。" });
+  if (parsed.phase === 0 && !parsed.qxEcho && /\$request\.(?:url|headers|method)\s*=|\$request\.headers\s*\[|\$done\s*\(\s*\$request\s*\)/.test(codeWithoutStrings)) diagnostics.push({ level: "error", code: "request-mutation-script", message: "完整请求脚本不能安全提升；Anywhere 的请求头、URL 和 method 为只读，请手工转换。" });
+  if (/\b(?:setTimeout|setInterval)\s*\(/.test(codeWithoutStrings)) {
+    diagnostics.push({ level: "warning", code: "script-timer-sample-required", message: "Anywhere 没有原生 timer；只支持零延时微任务，真实延时与 setInterval 会明确报错并透传，需人工适配。" });
+  }
   if (/\beval\s*\(|\bnew\s+Function\s*\(|\bFunction\s*\(/.test(codeWithoutStrings)) {
     diagnostics.push({ level: "warning", code: "script-dynamic-sample-required", message: "脚本运行时可能执行 eval/new Function 动态代码，已保留但需要样本和实机验证。" });
   }
-  if (parsed.phase === 0 && /\$done\s*\(\s*\{(?!\s*response\s*:)[\s\S]{0,300}?(?:\burl\b\s*(?=[,}])|(?:url|headers|method)\s*:)/.test(source)) {
+  if (parsed.phase === 0 && !parsed.qxEcho && /\$done\s*\(\s*\{(?!\s*response\s*:)[\s\S]{0,300}?(?:\burl\b\s*(?=[,}])|(?:url|headers|method)\s*:)/.test(source)) {
     diagnostics.push({ level: "error", code: "request-mutation-script", message: "request 脚本尝试修改 url/headers/method，Anywhere 脚本语义不能直接表达。" });
   }
   if (/\$httpClient\b|\$task\s*\.\s*fetch\b|\bfetch\s*\(|\bXMLHttpRequest\b|\.request\s*\(/.test(source)) {
@@ -1676,23 +1783,11 @@ function isLikelyStreamingScriptTarget(parsed, source = "") {
   return /text\/event-stream|event-stream|application\/(?:x-)?ndjson|jsonl|stream\+json|json-seq|(?:^|[/?&])sse(?:[/?&#\s]|$)|(?:^|[/?&])events?(?:[/?&#\s]|$)|(?:^|[/?&])stream(?:[/?&#\s]|$)|\bgrpc\b/.test(haystack);
 }
 
-function liftScriptToNativeRules(source, parsed) {
-  if (parsed.phase !== 1 || parsed.binaryBodyMode) return [];
-  const text = stripJsComments(String(source || ""));
-  if (!hasBodyCompletion(text)) return [];
-  const recursiveDeleteRules = liftRecursiveDeleteRules(text);
-  if (recursiveDeleteRules.length) return recursiveDeleteRules;
-  if (hasControlFlow(text)) return [];
-
-  const bodyReplace = liftBodyReplaceScript(text);
-  if (bodyReplace) return [bodyReplace];
-
-  const jsonRules = liftJsonMutationScript(text);
-  return jsonRules.length ? jsonRules : [];
-}
 
 function liftRequestRespondScript(source, parsed) {
   if (parsed.phase !== 0) return null;
+  const ast = parseScript(source);
+  if (!ast || ast.body.filter(x => x.type !== "EmptyStatement").length !== 1) return null;
   const text = stripJsComments(String(source || ""));
   if (hasControlFlow(text) || /=>/.test(stripJsStrings(text))) return null;
   const responseBody = extractDoneResponseObject(text);
@@ -1714,66 +1809,12 @@ function liftRequestRespondScript(source, parsed) {
   return { phase: 0, op: 100, pattern: urlGate(parsed.pattern), fields: [base64(script)], scriptSource: script, noScriptMerge: true };
 }
 
-function liftRequestMutationScript(source, parsed) {
-  if (parsed.phase !== 0) return [];
-  const text = stripJsComments(String(source || ""));
-  if (!/\$done\s*\(\s*(?:\$request|\{[\s\S]*?\})\s*\)\s*;?\s*$/.test(text)) return [];
-  if (hasControlFlow(text) || /=>|\$httpClient\b/.test(stripJsStrings(text))) return [];
-  const constants = extractLiteralConstants(text);
-  const rules = [];
-
-  const doneObject = extractDoneRequestObject(text);
-  if (doneObject) {
-    const doneUrl = propertyValueFromObjectLiteral(doneObject, ["url"]);
-    const target = parseJsStringForBodyReplace(doneUrl) ?? constants.get(doneUrl);
-    if (target) rules.push({ phase: 0, op: 0, pattern: "", fields: ["0", target] });
-
-    const doneHeaders = propertyValueFromObjectLiteral(doneObject, ["headers"]);
-    const headerPairs = parseStaticHeadersLiteral(doneHeaders);
-    if (headerPairs) {
-      for (const [name, value] of headerPairs) rules.push({ phase: 0, op: 3, pattern: "", fields: [name, value] });
-    }
-  }
-
-  const urlMatch = text.match(/\$request\.url\s*=\s*(["'][^"']+["']|[A-Za-z_$][\w$]*)\s*;?/);
-  if (urlMatch) {
-    const target = parseJsStringForBodyReplace(urlMatch[1]) ?? constants.get(urlMatch[1]);
-    if (target) rules.push({ phase: 0, op: 0, pattern: "", fields: ["0", target] });
-  }
-
-  const urlReplaceMatch = text.match(/\$request\.url\s*=\s*\$request\.url\.replace\s*\(\s*\/((?:\\\/|[^/])+)\/[a-z]*\s*,\s*(["'][^"']+["']|[A-Za-z_$][\w$]*)\s*\)\s*;?/);
-  if (urlReplaceMatch) {
-    const target = parseJsStringForBodyReplace(urlReplaceMatch[2]) ?? constants.get(urlReplaceMatch[2]);
-    if (target && /^https?:\/\//i.test(target)) rules.push({ phase: 0, op: 0, pattern: "", fields: ["0", target] });
-  }
-
-  const headerSetPattern = /\$request\.headers(?:\[\s*(["'][^"']+["']|[A-Za-z_$][\w$]*)\s*\]|\.([A-Za-z_$][\w$-]*))\s*=\s*(["'][^"']*["']|[A-Za-z_$][\w$]*)\s*;?/g;
-  for (const match of text.matchAll(headerSetPattern)) {
-    const name = parseJsStringForBodyReplace(match[1]) || constants.get(match[1]) || match[2];
-    const value = parseJsStringForBodyReplace(match[3]) ?? constants.get(match[3]);
-    if (name && value != null) rules.push({ phase: 0, op: 3, pattern: "", fields: [name, value] });
-  }
-
-  const headerDeletePattern = /delete\s+\$request\.headers(?:\[\s*(["'][^"']+["']|[A-Za-z_$][\w$]*)\s*\]|\.([A-Za-z_$][\w$-]*))\s*;?/g;
-  for (const match of text.matchAll(headerDeletePattern)) {
-    const name = parseJsStringForBodyReplace(match[1]) || constants.get(match[1]) || match[2];
-    if (name) rules.push({ phase: 0, op: 2, pattern: "", fields: [name] });
-  }
-
-  const headerAssignPattern = /Object\.assign\s*\(\s*\$request\.headers\s*,\s*(\{[\s\S]*?\})\s*\)\s*;?/g;
-  for (const match of text.matchAll(headerAssignPattern)) {
-    const headerPairs = parseStaticHeadersLiteral(match[1]);
-    if (!headerPairs) continue;
-    for (const [name, value] of headerPairs) rules.push({ phase: 0, op: 3, pattern: "", fields: [name, value] });
-  }
-
-  return rules;
-}
 
 function liftRequestQueryRedirectScript(source, parsed) {
   if (parsed.phase !== 0) return null;
   const text = stripJsComments(String(source || ""));
   const stripped = stripJsStrings(text);
+  if (/(?:\$[A-Za-z_][\w$]*)/.test(stripped.replace(/\$request\b|\$done\b/g, "")) || /\b(?:async|await|Promise|globalThis|setTimeout|setInterval)\b/.test(stripped)) return null;
   if (!/\$request\.url/.test(text) || !/decodeURIComponent\s*\(/.test(text)) return null;
   if (!/\$done\s*\(\s*\{\s*response\s*:/.test(text)) return null;
   if (!/\bstatus\s*:\s*302\b/.test(text)) return null;
@@ -1781,24 +1822,16 @@ function liftRequestQueryRedirectScript(source, parsed) {
   if (/\$httpClient\b|\$task\b|\b(?:fetch|XMLHttpRequest|eval|Function)\b/.test(stripped)) return null;
   const params = extractRedirectQueryParams(text);
   if (!params.length) return null;
+  if (parsed.argument || parsed.runtimeArgument) return null;
   const script = `function process(ctx) {
   if (ctx.phase !== "request" || !ctx.url) return;
-  var query = String(ctx.url).split("?")[1] || "";
-  var params = ${JSON.stringify(params)};
-  for (var i = 0; i < params.length; i++) {
-    var match = query.match(new RegExp("(?:^|&)" + params[i] + "=([^&]+)"));
-    if (!match) continue;
-    try {
-      var target = decodeURIComponent(match[1]);
-      if (!/^https?:\\/\\//.test(target)) return;
-      Anywhere.respond({
-        status: 302,
-        headers: [["location", target], ["cache-control", "no-cache"]],
-        body: ""
-      });
-      return;
-    } catch (_) {}
-  }
+  var directive;
+  try {
+    (function ($request, $done) {
+${source}
+    })({ url: ctx.url, method: ctx.method, headers: Object.fromEntries(ctx.headers || []) }, function (value) { directive = value; });
+    if (directive && directive.response) Anywhere.respond(directive.response);
+  } catch (error) { Anywhere.log.error(String(error)); }
 }`;
   return { phase: 0, op: 100, pattern: urlGate(parsed.pattern), fields: [base64(script)], scriptSource: script, noScriptMerge: true };
 }
@@ -1807,6 +1840,7 @@ function liftRequestUrlProxyScript(source, parsed) {
   if (parsed.phase !== 0) return null;
   const text = stripJsComments(String(source || ""));
   const stripped = stripJsStrings(text);
+  if (parsed.argument || parsed.runtimeArgument || /(?:\$[A-Za-z_][\w$]*)/.test(stripped.replace(/\$request\b|\$done\b/g, "")) || /\b(?:async|await|Promise|globalThis|setTimeout|setInterval)\b/.test(stripped)) return null;
   if (!/\$request\.url/.test(text)) return null;
   if (!/\$done\s*\(\s*\{\s*(?:url\b|url\s*:)/.test(text)) return null;
   if (/\$httpClient\b|\$task\b|\b(?:fetch|XMLHttpRequest|eval|Function|importScripts|require)\b/.test(stripped)) return null;
@@ -1830,16 +1864,12 @@ function liftRequestUrlProxyScript(source, parsed) {
 
   const script = `async function process(ctx) {
   if (ctx.phase !== "request" || !ctx.url) return;
-  var target = String(ctx.url);
-  var replacements = ${JSON.stringify(replacements)};
-  for (var i = 0; i < replacements.length; i++) {
-    var item = replacements[i];
-    if (item.kind === "regex") {
-      target = target.replace(new RegExp(item.search, item.flags || ""), item.replacement);
-    } else {
-      target = target.replace(item.search, item.replacement);
-    }
-  }
+  var directive;
+  try { (function ($request, $done) {
+${source}
+  })({ url: ctx.url }, function (value) { directive = value; }); }
+  catch (error) { Anywhere.log.error(String(error)); return; }
+  var target = directive && directive.url;
   if (target === ctx.url || !/^https?:\\/\\//i.test(target)) return;
   var headers = [];
   (ctx.headers || []).forEach(function (header) {
@@ -1988,13 +2018,6 @@ function liftBodyReplaceScript(text) {
   return { phase: 1, op: 4, pattern: "", fields: [match[1].replaceAll("\\/", "/"), replacement] };
 }
 
-function liftJsonMutationScript(text) {
-  const variable = findJsonParseVariable(text);
-  if (!variable) return [];
-  if (!hasJsonBodyOutput(text, variable)) return [];
-
-  return liftJsonMutationRulesFromText(text, variable);
-}
 
 function hasBodyCompletion(text) {
   return /\$done\s*\(\s*\{[^}]*\bbody\s*:/.test(text)
@@ -2036,60 +2059,8 @@ function liftJsonMutationRulesFromText(text, variable) {
   return rules;
 }
 
-function liftGuardedJsonBranchRules(source, parsed, { aggressive = false } = {}) {
-  if (parsed.phase !== 1 || parsed.binaryBodyMode) return [];
-  const text = stripJsComments(String(source || ""));
-  if (!hasBodyCompletion(text)) return [];
-  const variable = findJsonParseVariable(text);
-  if (!variable) return [];
-  if (!hasJsonBodyOutput(text, variable)) return [];
-  const stripped = stripJsStrings(text);
-  if (/\b(?:fetch|XMLHttpRequest|eval|Function|importScripts|require)\b|\$httpClient\b|\$task\s*\.\s*fetch\b/.test(stripped)) return [];
 
-  const rules = [];
-  const urlVariables = findRequestUrlVariables(text);
-  for (const block of extractIfBlocks(text)) {
-    const branchPattern = urlGuardToPattern(block.condition, parsed.pattern, urlVariables);
-    if (!branchPattern) continue;
-    const strippedBody = stripJsStrings(block.body);
-    if (hasUnsafeBranchControlFlow(block.body) || /=>\s*\{/.test(strippedBody)) continue;
-    if (new RegExp(`\\b(?!if\\b)[A-Za-z_$][\\w$]*\\s*\\(\\s*${escapeRegExp(variable)}\\b`).test(stripJsStrings(block.body))) continue;
-    if (new RegExp(`\\b${escapeRegExp(variable)}\\s*=`).test(stripJsStrings(block.body))) continue;
-    let branchRules = aggressive
-      ? liftAggressiveJsonMutationRulesFromText(block.body, variable)
-      : liftJsonMutationRulesFromText(block.body, variable);
-    if (/\bif\b/.test(strippedBody)) branchRules = branchRules.filter((rule) => rule.fields[0] === "delete");
-    for (const rule of branchRules) {
-      rules.push({ ...rule, pattern: branchPattern });
-    }
-  }
-  return rules;
-}
 
-function liftAggressiveScriptToNativeRules(source, parsed) {
-  if (parsed.phase !== 1 || parsed.binaryBodyMode) return [];
-  const text = stripJsComments(String(source || ""));
-  const variable = findJsonParseVariable(text);
-  if (!variable) return [];
-  if (!hasBodyCompletion(text) || !hasJsonBodyOutput(text, variable)) return [];
-  const stripped = stripJsStrings(text);
-  if (/\b(?:fetch|XMLHttpRequest|eval|Function|importScripts|require)\b|\$httpClient\b|\$task\s*\.\s*fetch\b/.test(stripped)) return [];
-
-  const guarded = liftGuardedJsonBranchRules(source, parsed, { aggressive: true });
-  if (guarded.length) return guarded;
-  if (hasControlFlow(text)) return [];
-  return liftAggressiveJsonMutationRulesFromText(text, variable).map((rule) => ({ ...rule, pattern: urlGate(parsed.pattern) }));
-}
-
-function liftAggressiveJsonMutationRulesFromText(text, variable) {
-  const rules = liftJsonMutationRulesFromText(text, variable);
-  const spliceClearPattern = new RegExp(`${escapeRegExp(variable)}((?:\\.[A-Za-z_$][\\w$]*|\\[['"][^'"]+['"]\\])+?)\\.splice\\s*\\(\\s*0\\s*(?:,\\s*${escapeRegExp(variable)}\\1\\.length\\s*)?\\)\\s*;`, "g");
-  for (const match of text.matchAll(spliceClearPattern)) {
-    const path = jsonPathFromJsAccess(match[1]);
-    if (path) rules.push({ phase: 1, op: 5, pattern: "", fields: ["replace", path, "[]"] });
-  }
-  return rules;
-}
 
 function extractIfBlocks(text) {
   const blocks = [];
@@ -2527,8 +2498,10 @@ function escapeRegExp(value) {
 }
 
 function wrapLoonSurgeScript(source, parsed) {
-  const encodedSource = base64(source);
+  const stripped = stripJsStrings(stripJsComments(source));
+  if (!parsed.qxEcho && !parsed.runtimeArgument && !/\b(?:Env|URL|URLSearchParams|TextEncoder|TextDecoder|atob|btoa|crypto|fetch|setTimeout|setInterval|clearTimeout|clearInterval|require|eval|Function|globalThis)\b|\$(?!(?:request|response|done|argument)\b)[A-Za-z_]/.test(stripped)) return wrapBodyScript(source, parsed);
   const phase = parsed.phase === 0 ? "request" : "response";
+  const isQX = parsed.dialect === "quantumult-x";
   const argument = String(parsed.argument || "");
   const runtimeArgument = parsed.runtimeArgument || null;
   const argumentHelper = runtimeArgument ? `  function __argumentTemplate(template, fallback) {
@@ -2544,13 +2517,15 @@ function wrapLoonSurgeScript(source, parsed) {
     });
   }
 ` : "";
-  const argumentExpression = runtimeArgument
+  const argumentExpression = parsed.loonArgumentCode || (runtimeArgument
     ? `__argumentTemplate(${JSON.stringify(runtimeArgument.template)}, ${JSON.stringify(runtimeArgument.fallback || {})}, ${JSON.stringify(runtimeArgument.params || {})})`
-    : JSON.stringify(argument);
+    : JSON.stringify(argument));
   const timeoutMs = parsed.timeoutMs || 4500;
   const binaryBodyMode = parsed.binaryBodyMode === true;
-  return `async function process(ctx) {
-  var __source = Anywhere.codec.utf8.decode(Anywhere.codec.base64.decode("${encodedSource}"));
+  const runnerName = "__converter_runner_full_" + sourceId(source);
+  const runnerArgs = "$request, $response, $done, $persistentStore, $prefs, $httpClient, $task, $argument, $notification, $notify, $environment, $loon, $utils, Env, setTimeout, clearTimeout, setInterval, clearInterval, URL, URLSearchParams, TextEncoder, TextDecoder, atob, btoa, fetch, crypto";
+  return `function ${runnerName}(${runnerArgs}) {\n${source}\n}\nasync function process(ctx) {
+  ${parsed.loonGuard ? `if (!(${parsed.loonGuard})) return;` : ""}
   var __binaryBodyMode = ${binaryBodyMode ? "true" : "false"};
   function __bodyIn(value) {
     if (!value) return new Uint8Array();
@@ -2559,9 +2534,14 @@ function wrapLoonSurgeScript(source, parsed) {
     if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
     return value;
   }
-  var __bodyBytes = __bodyIn(ctx.body);
-  var __bodyText = "";
-  try { if (ctx.body && !__binaryBodyMode) __bodyText = Anywhere.codec.utf8.decode(ctx.body); } catch (_) { __bodyText = ""; }
+  var __bodyBytes = new Uint8Array(__bodyIn(ctx.body));
+  var __bodyText;
+  function __textBody() {
+    if (__bodyText === undefined) {
+      try { __bodyText = ctx.body ? Anywhere.codec.utf8.decode(ctx.body) : ""; } catch (_) { __bodyText = ""; }
+    }
+    return __bodyText;
+  }
   var __finished = false;
   var __resolveDone;
   var __donePromise = new Promise(function (resolve) { __resolveDone = resolve; });
@@ -2580,24 +2560,21 @@ function wrapLoonSurgeScript(source, parsed) {
   var __nativeCrypto = typeof globalThis !== "undefined" && globalThis.crypto ? globalThis.crypto : null;
   function __setTimeout(callback, ms) {
     if (__nativeSetTimeout) return __nativeSetTimeout(callback, ms);
+    if (Number(ms) > 0) throw new Error("Anywhere has no native timers: positive setTimeout delay is unsupported");
     var id = __timerSeed++;
     __timers[id] = true;
     Promise.resolve().then(function () {
       if (!__timers[id]) return;
       delete __timers[id];
-      if (typeof callback === "function") callback();
+      try { if (typeof callback === "function") callback(); }
+      catch (error) { Anywhere.log.error(String(error)); __finishUnchanged(); }
     });
     return id;
   }
   function __clearTimeout(id) { if (__nativeClearTimeout) return __nativeClearTimeout(id); delete __timers[id]; }
   function __setInterval(callback, ms) {
     if (__nativeSetInterval) return __nativeSetInterval(callback, ms);
-    var id = __timerSeed++;
-    __timers[id] = true;
-    Promise.resolve().then(function () {
-      if (__timers[id] && typeof callback === "function") callback();
-    });
-    return id;
+    throw new Error("Anywhere has no native timers: setInterval is unsupported");
   }
   function __clearInterval(id) { if (__nativeClearInterval) return __nativeClearInterval(id); delete __timers[id]; }
   function __TextEncoderShim() {}
@@ -2660,27 +2637,42 @@ function wrapLoonSurgeScript(source, parsed) {
   };
   __URLSearchParamsShim.prototype.set = function (key, value) {
     key = String(key);
+    var found = false;
     for (var i = 0; i < this.__pairs.length; i++) {
       if (this.__pairs[i][0] === key) {
-        this.__pairs[i][1] = String(value);
-        return;
+        if (found) { this.__pairs.splice(i--, 1); }
+        else { this.__pairs[i][1] = String(value); found = true; }
       }
     }
-    this.__pairs.push([key, String(value)]);
+    if (!found) this.__pairs.push([key, String(value)]);
+    if (this.__update) this.__update();
   };
-  __URLSearchParamsShim.prototype.append = function (key, value) { this.__pairs.push([String(key), String(value)]); };
+  __URLSearchParamsShim.prototype.append = function (key, value) { this.__pairs.push([String(key), String(value)]); if (this.__update) this.__update(); };
+  __URLSearchParamsShim.prototype.getAll = function (key) { return this.__pairs.filter(function (p) { return p[0] === String(key); }).map(function (p) { return p[1]; }); };
+  __URLSearchParamsShim.prototype.delete = function (key) { this.__pairs = this.__pairs.filter(function (p) { return p[0] !== String(key); }); if (this.__update) this.__update(); };
+  __URLSearchParamsShim.prototype.forEach = function (callback, self) { var that = this; this.__pairs.forEach(function (p) { callback.call(self, p[1], p[0], that); }); };
   __URLSearchParamsShim.prototype.toString = function () {
     var out = [];
-    for (var i = 0; i < this.__pairs.length; i++) out.push(encodeURIComponent(this.__pairs[i][0]) + "=" + encodeURIComponent(this.__pairs[i][1]));
+    function encode(value) { return encodeURIComponent(value).replace(/[!'()~]/g, function (c) { return "%" + c.charCodeAt(0).toString(16).toUpperCase(); }).replace(/%20/g, "+"); }
+    for (var i = 0; i < this.__pairs.length; i++) out.push(encode(this.__pairs[i][0]) + "=" + encode(this.__pairs[i][1]));
     return out.join("&");
   };
   var __NativeURL = typeof globalThis !== "undefined" && typeof globalThis.URL === "function" ? globalThis.URL : null;
   var __NativeURLSearchParams = typeof globalThis !== "undefined" && typeof globalThis.URLSearchParams === "function" ? globalThis.URLSearchParams : null;
-  function __URLShim(input) {
-    if (__NativeURL) return new __NativeURL(input);
+  function __URLShim(input, base) {
+    if (__NativeURL) return new __NativeURL(input, base);
     var raw = String(input || "");
+    if (!/^https?:\\/\\//i.test(raw) && base) {
+      var parent = new __URLShim(String(base));
+      if (raw.slice(0, 2) === "//") raw = parent.protocol + raw;
+      else if (raw.charAt(0) === "?") raw = parent.origin + parent.pathname + raw;
+      else if (raw.charAt(0) === "#") raw = parent.origin + parent.pathname + parent.search + raw;
+      else raw = parent.origin + (raw.charAt(0) === "/" ? raw : parent.pathname.replace(/[^/]*$/, "") + raw);
+    }
     var match = raw.match(/^([a-zA-Z][a-zA-Z0-9+.-]*:)?\\/\\/([^/?#]*)([^?#]*)(\\?[^#]*)?(#.*)?$/);
+    if (!match || !/^https?:$/i.test(match[1] || "") || !match[2]) throw new TypeError("URL shim expects an absolute HTTP(S) URL or a valid base");
     var authority = match ? match[2] : "";
+    if (!/^[A-Za-z0-9.-]+(?::[0-9]+)?$/.test(authority)) throw new TypeError("URL shim does not support credentials, IPv6 or IDN authority");
     var hostParts = authority.split("@").pop().split(":");
     this.href = raw;
     this.protocol = match && match[1] ? match[1] : "";
@@ -2691,25 +2683,48 @@ function wrapLoonSurgeScript(source, parsed) {
     this.search = match && match[4] ? match[4] : (raw.indexOf("?") >= 0 ? "?" + raw.split("?")[1].split("#")[0] : "");
     this.hash = match && match[5] ? match[5] : (raw.indexOf("#") >= 0 ? "#" + raw.split("#")[1] : "");
     this.origin = this.protocol && authority ? this.protocol + "//" + authority : "";
-    this.searchParams = new (__NativeURLSearchParams || __URLSearchParamsShim)(this.search);
+    var that = this;
+    var hostName = this.hostname.toLowerCase(), port = this.port, protocol = this.protocol.toLowerCase();
+    function normalizedPort() { return (protocol === "https:" && port === "443") || (protocol === "http:" && port === "80") ? "" : port; }
+    Object.defineProperty(this, "protocol", { enumerable: true, configurable: true, get: function () { return protocol; }, set: function (value) { value = String(value).toLowerCase(); if (!/^https?:$/.test(value)) throw new TypeError("Unsupported URL protocol"); protocol = value; } });
+    Object.defineProperty(this, "hostname", { enumerable: true, configurable: true, get: function () { return hostName; }, set: function (value) { value = String(value).toLowerCase(); if (!/^[a-z0-9.-]+$/.test(value)) throw new TypeError("Unsupported URL hostname"); hostName = value; } });
+    Object.defineProperty(this, "port", { enumerable: true, configurable: true, get: normalizedPort, set: function (value) { value = String(value); if (value && (!/^[0-9]+$/.test(value) || Number(value) > 65535)) throw new TypeError("Invalid URL port"); port = value; } });
+    Object.defineProperty(this, "host", { enumerable: true, configurable: true, get: function () { return hostName + (normalizedPort() ? ":" + normalizedPort() : ""); }, set: function (value) { var next = String(value).match(/^([A-Za-z0-9.-]+)(?::([0-9]+))?$/); if (!next) throw new TypeError("Unsupported URL host"); that.hostname = next[1]; that.port = next[2] || ""; } });
+    Object.defineProperty(this, "origin", { enumerable: true, configurable: true, get: function () { return that.protocol + "//" + that.host; } });
+    var search = this.search;
+    this.searchParams = new __URLSearchParamsShim(search);
+    this.searchParams.__update = function () { var query = that.searchParams.toString(); search = query ? "?" + query : ""; };
+    Object.defineProperty(this, "search", { enumerable: true, configurable: true,
+      get: function () { return search; },
+      set: function (value) { search = String(value || ""); if (search && search.charAt(0) !== "?") search = "?" + search; that.searchParams.__pairs = new __URLSearchParamsShim(search).__pairs; }
+    });
+    Object.defineProperty(this, "href", { enumerable: true, configurable: true,
+      get: function () { return that.protocol + "//" + that.host + (that.pathname || "/") + search + that.hash; },
+      set: function (value) { var next = new __URLShim(value); that.protocol = next.protocol; that.host = next.host; that.hostname = next.hostname; that.port = next.port; that.pathname = next.pathname; that.search = next.search; that.hash = next.hash; }
+    });
   }
   __URLShim.prototype.toString = function () { return this.href; };
-  try {
-    if (typeof globalThis !== "undefined") {
-      if (typeof globalThis.setTimeout !== "function") globalThis.setTimeout = __setTimeout;
-      if (typeof globalThis.clearTimeout !== "function") globalThis.clearTimeout = __clearTimeout;
-      if (typeof globalThis.setInterval !== "function") globalThis.setInterval = __setInterval;
-      if (typeof globalThis.clearInterval !== "function") globalThis.clearInterval = __clearInterval;
-      if (typeof globalThis.URL !== "function") globalThis.URL = __URLShim;
-      if (typeof globalThis.URLSearchParams !== "function") globalThis.URLSearchParams = __URLSearchParamsShim;
-      if (typeof globalThis.TextEncoder !== "function") globalThis.TextEncoder = __TextEncoderShim;
-      if (typeof globalThis.TextDecoder !== "function") globalThis.TextDecoder = __TextDecoderShim;
-      if (typeof globalThis.atob !== "function") globalThis.atob = __atobShim;
-      if (typeof globalThis.btoa !== "function") globalThis.btoa = __btoaShim;
-      if (typeof globalThis.fetch !== "function") globalThis.fetch = __fetch;
-      if (!globalThis.crypto) globalThis.crypto = __cryptoShim;
+  var __installedGlobals = [];
+  function __installGlobal(name, value) {
+    if (typeof globalThis === "undefined" || globalThis[name]) return;
+    try {
+      var descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+      globalThis[name] = value;
+      __installedGlobals.push([name, descriptor]);
+    } catch (_) {}
+  }
+  function __restoreGlobals() {
+    for (var i = 0; i < __installedGlobals.length; i++) {
+      var entry = __installedGlobals[i];
+      try { if (entry[1]) Object.defineProperty(globalThis, entry[0], entry[1]); else delete globalThis[entry[0]]; } catch (_) {}
     }
-  } catch (_) {}
+  }
+  __installGlobal("setTimeout", __setTimeout); __installGlobal("clearTimeout", __clearTimeout);
+  __installGlobal("setInterval", __setInterval); __installGlobal("clearInterval", __clearInterval);
+  __installGlobal("URL", __URLShim); __installGlobal("URLSearchParams", __URLSearchParamsShim);
+  __installGlobal("TextEncoder", __TextEncoderShim); __installGlobal("TextDecoder", __TextDecoderShim);
+  __installGlobal("atob", __atobShim); __installGlobal("btoa", __btoaShim);
+  __installGlobal("fetch", __fetch); __installGlobal("crypto", __cryptoShim);
   function __headersObject(headers) {
     var out = {};
     if (!headers) return out;
@@ -2738,16 +2753,31 @@ function wrapLoonSurgeScript(source, parsed) {
     __finished = true;
     __resolveDone();
   }
-  var $request = { url: ctx.url || "", method: ctx.method || "GET", headers: __headersObject(ctx.headers), body: __binaryBodyMode ? __bodyBytes : __bodyText, bodyBytes: __bodyBytes };
-  var $response = { status: ctx.status || 200, statusCode: ctx.status || 200, headers: __headersObject(ctx.headers), body: __binaryBodyMode ? __bodyBytes : __bodyText, bodyBytes: __bodyBytes };
+  var __requestBodyState = {}, __responseBodyState = {};
+  function __attachBody(object, state) {
+    var value, assigned = false;
+    Object.defineProperty(object, "body", { enumerable: true, configurable: true,
+      get: function () { return assigned ? value : (__binaryBodyMode ? __bodyBytes : __textBody()); },
+      set: function (next) { value = next; assigned = true; state.assigned = true; }
+    });
+    return object;
+  }
+  var $request = __attachBody({ url: ctx.url || "", method: ctx.method || "GET", headers: __headersObject(ctx.headers), bodyBytes: ${isQX ? "__arrayBufferFromBytes(__bodyBytes)" : "__bodyBytes"} }, __requestBodyState);
+  ${phase === "response" ? `for (var unavailable of ["headers", "body", "bodyBytes"]) Object.defineProperty($request, unavailable, { configurable: true, enumerable: true, get: function () { throw new Error("Original request head/body is unavailable in Anywhere response context"); } });` : ""}
+  var $response = __attachBody({ status: ctx.status || 200, statusCode: ctx.status || 200, headers: __headersObject(ctx.headers), bodyBytes: ${isQX ? "__arrayBufferFromBytes(__bodyBytes)" : "__bodyBytes"} }, __responseBodyState);
   var $environment = { system: "Anywhere", "surge-version": "0", "loon-version": "0" };
+  __installGlobal("$environment", $environment);
+  __installGlobal("$script", { startTime: Date.now() / 1000, name: "Anywhere Converter" });
   var $loon = "Anywhere";
 ${argumentHelper}  var $argument = ${argumentExpression};
+  __installGlobal("$argument", $argument);
+  __installGlobal("$request", $request); __installGlobal("$response", $response); __installGlobal("$done", $done);
   var $persistentStore = {
     read: function (key) { return Anywhere.store.getString(String(key), true) || null; },
     write: function (value, key) { Anywhere.store.set(String(key), Anywhere.codec.utf8.encode(String(value == null ? "" : value)), true); return true; }
   };
-  var $prefs = { valueForKey: $persistentStore.read, setValueForKey: function (value, key) { return $persistentStore.write(value, key); } };
+  var $prefs = { valueForKey: $persistentStore.read, setValueForKey: function (value, key) { return $persistentStore.write(value, key); }, removeValueForKey: function (key) { Anywhere.store.delete(String(key), true); return true; } };
+  __installGlobal("$persistentStore", $persistentStore); __installGlobal("$prefs", $prefs);
   var $notification = { post: function () {} };
   var $notify = function () {};
   var $utils = {
@@ -2762,9 +2792,10 @@ ${argumentHelper}  var $argument = ${argumentExpression};
   };
   var $task = {
     fetch: function (request) {
-      return __httpPromise(request && request.method || "GET", request, request && request.body);
+      return __httpPromise(request && request.method || "GET", request, request && (request.body != null ? request.body : request.bodyBytes));
     }
   };
+  ${isQX ? '__installGlobal("$task", $task);' : ""}
   function __http(method, request, body, callback) {
     var url = typeof request === "string" ? request : request.url;
     var headers = typeof request === "string" ? {} : (request.headers || {});
@@ -2778,14 +2809,14 @@ ${argumentHelper}  var $argument = ${argumentExpression};
     var headers = typeof request === "string" ? {} : (request.headers || {});
     __pendingHttp += 1;
     return Promise.resolve(Anywhere.http.request({ method: method, url: url, headers: headers, body: body })).then(function (res) {
-      var bodyText = res.body ? Anywhere.codec.utf8.decode(res.body) : "";
-      return {
+      var response = {
         statusCode: res.status || 200,
         status: res.status || 200,
         headers: __headersObject(res.headers),
-        body: bodyText,
-        bodyBytes: res.body || new Uint8Array()
+        bodyBytes: ${isQX ? "__arrayBufferFromBytes(res.body || new Uint8Array())" : "res.body || new Uint8Array()"}
       };
+      Object.defineProperty(response, "body", { enumerable: true, get: function () { return res.body ? Anywhere.codec.utf8.decode(res.body) : ""; } });
+      return response;
     }).finally(function () { __pendingHttp -= 1; });
   }
   function __arrayBufferFromBytes(value) {
@@ -2828,6 +2859,13 @@ ${argumentHelper}  var $argument = ${argumentExpression};
   }
   function $done(value) {
     if (__finished) return;
+    ${parsed.qxEcho ? `if (value && Object.keys(value).length) {
+      var status = value.status || value.statusCode || 200;
+      if (typeof status === "string") status = Number(status.match(/^HTTP\\/[0-9.]+\\s+(\\d{3})/)?.[1] || status);
+      if (!Number.isInteger(status) || status < 100 || status > 599) throw new TypeError("Invalid QX echo status");
+      Anywhere.respond({status: status, headers: value.headers || [], body: value.body != null ? value.body : value.bodyBytes || ""});
+      __finishUnchanged(); return;
+    }` : ""}
     if (value && value.response && "${phase}" === "request") {
       var response = value.response;
       Anywhere.respond({
@@ -2839,12 +2877,14 @@ ${argumentHelper}  var $argument = ${argumentExpression};
       __resolveDone();
       return;
     }
-    if (value && Object.prototype.hasOwnProperty.call(value, "body")) {
+    if (value && value.bodyBytes != null && (!Object.prototype.hasOwnProperty.call(value, "body") || value.body == null)) {
+      if (!__setBodyIfWithinCap(__bodyOut(value.bodyBytes))) { __finishUnchanged(); return; }
+    } else if (value && Object.prototype.hasOwnProperty.call(value, "body")) {
       if (!__setBodyIfWithinCap(__bodyOut(value.body))) {
         __finishUnchanged();
         return;
       }
-    } else if (typeof $response !== "undefined" && "${phase}" === "response" && (__binaryBodyMode ? $response.body !== __bodyBytes : $response.body !== __bodyText)) {
+    } else if ("${phase}" === "response" && __responseBodyState.assigned) {
       if (!__setBodyIfWithinCap(__bodyOut($response.body))) {
         __finishUnchanged();
         return;
@@ -2855,9 +2895,9 @@ ${argumentHelper}  var $argument = ${argumentExpression};
   function Env(name) {
     return {
       name: name || "Anywhere",
-      isSurge: function () { return true; },
+      isSurge: function () { return ${!isQX}; },
       isLoon: function () { return false; },
-      isQuanX: function () { return false; },
+      isQuanX: function () { return ${isQX}; },
       isNode: function () { return false; },
       toObj: function (value, fallback) { try { return JSON.parse(value); } catch (_) { return fallback == null ? null : fallback; } },
       toStr: function (value, fallback) { try { return JSON.stringify(value); } catch (_) { return fallback == null ? null : fallback; } },
@@ -2877,16 +2917,70 @@ ${argumentHelper}  var $argument = ${argumentExpression};
     };
   }
   try {
-    var __returnValue = (new Function("$request", "$response", "$done", "$persistentStore", "$prefs", "$httpClient", "$task", "$argument", "$notification", "$notify", "$environment", "$loon", "$utils", "Env", "setTimeout", "clearTimeout", "setInterval", "clearInterval", "URL", "URLSearchParams", "TextEncoder", "TextDecoder", "atob", "btoa", "fetch", "crypto", __source))($request, $response, $done, $persistentStore, $prefs, $httpClient, $task, $argument, $notification, $notify, $environment, $loon, $utils, Env, __setTimeout, __clearTimeout, __setInterval, __clearInterval, __NativeURL || __URLShim, __NativeURLSearchParams || __URLSearchParamsShim, __NativeTextEncoder || __TextEncoderShim, __NativeTextDecoder || __TextDecoderShim, __nativeAtob || __atobShim, __nativeBtoa || __btoaShim, __nativeFetch || __fetch, __nativeCrypto || __cryptoShim);
+    var __returnValue = ${runnerName}($request, $response, $done, $persistentStore, $prefs, $httpClient, $task, $argument, $notification, $notify, $environment, ${isQX ? "undefined" : "$loon"}, $utils, Env, __setTimeout, __clearTimeout, __setInterval, __clearInterval, __NativeURL || __URLShim, __NativeURLSearchParams || __URLSearchParamsShim, __NativeTextEncoder || __TextEncoderShim, __NativeTextDecoder || __TextDecoderShim, __nativeAtob || __atobShim, __nativeBtoa || __btoaShim, __nativeFetch || __fetch, __nativeCrypto || __cryptoShim);
     if (__returnValue && typeof __returnValue.then === "function") {
-      Promise.resolve(__returnValue).catch(function (error) { Anywhere.log.error(String(error && error.stack || error)); });
+      await Promise.resolve(__returnValue).catch(function (error) { Anywhere.log.error(String(error && error.stack || error)); __finishUnchanged(); });
     }
   } catch (error) {
     Anywhere.log.error(String(error && error.stack || error));
+    __finishUnchanged();
   }
+  await Promise.resolve();
+  ${/\$done|\bEnv\s*\(/.test(source) ? "" : "if (!__finished && __pendingHttp <= 0 && Object.keys(__timers).length === 0) __finishUnchanged();"}
   var __timeoutPromise = __nativeSetTimeout ? new Promise(function (resolve) { __setTimeout(resolve, ${timeoutMs}); }) : __donePromise;
   await Promise.race([__donePromise, __timeoutPromise]);
   if (!__finished && __pendingHttp <= 0) __finish();
+  __restoreGlobals();
+}`;
+}
+
+// Body-only scripts do not need storage, HTTP, Env or Web-API shims. Keep the
+// original source verbatim and share its static runner exactly as in full mode.
+function wrapBodyScript(source, parsed) {
+  const phase = parsed.phase === 0 ? "request" : "response";
+  const runner = "__converter_runner_body_" + sourceId(source);
+  return `function ${runner}($request, $response, $done, $argument) {\n${source}\n}
+async function process(ctx) {
+  ${parsed.loonGuard ? `if (!(${parsed.loonGuard})) return;` : ""}
+  var finished = false, resolveDone;
+  var donePromise = new Promise(function (resolve) { resolveDone = resolve; });
+  var text, bytes;
+  var responseAssigned = false;
+  function body() {
+    if (${parsed.binaryBodyMode === true}) { if (!bytes) bytes = new Uint8Array(ctx.body || []); return bytes; }
+    if (text === undefined) text = ctx.body ? Anywhere.codec.utf8.decode(ctx.body) : "";
+    return text;
+  }
+  function headers() { var out = {}; (ctx.headers || []).forEach(function (p) { out[String(p[0]).toLowerCase()] = String(p[1]); }); return out; }
+  function attach(object, response) {
+    var assigned = false, value;
+    Object.defineProperty(object, "body", { enumerable: true, configurable: true,
+      get: function () { return assigned ? value : body(); },
+      set: function (next) { assigned = true; value = next; if (response) responseAssigned = true; }
+    });
+    Object.defineProperty(object, "bodyBytes", { enumerable: true, configurable: true, get: function () { if (!bytes) bytes = new Uint8Array(ctx.body || []); return ${parsed.dialect === "quantumult-x" ? "bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)" : "bytes"}; } });
+    return object;
+  }
+  var $request = attach({url: ctx.url, method: ctx.method || "GET", headers: headers()}, false);
+  ${phase === "response" ? `for (var unavailable of ["headers", "body", "bodyBytes"]) Object.defineProperty($request, unavailable, { configurable: true, enumerable: true, get: function () { throw new Error("Original request head/body is unavailable in Anywhere response context"); } });` : ""}
+  var $response = attach({status: ctx.status || 200, statusCode: ctx.status || 200, headers: headers()}, true);
+  function unchanged() { if (!finished) { finished = true; resolveDone(); } }
+  function $done(value) {
+    if (finished) return;
+    if (value && value.response && "${phase}" === "request") { Anywhere.respond(value.response); unchanged(); return; }
+    var hasBody = value && Object.prototype.hasOwnProperty.call(value, "body");
+    var hasBytes = value && value.bodyBytes != null && (!hasBody || value.body == null);
+    if (hasBytes || hasBody || responseAssigned && "${phase}" === "response") {
+      var output = hasBytes ? value.bodyBytes : hasBody ? value.body : $response.body;
+      var next = output instanceof ArrayBuffer ? new Uint8Array(output) : ArrayBuffer.isView(output) ? new Uint8Array(output.buffer, output.byteOffset, output.byteLength) : Anywhere.codec.utf8.encode(String(output == null ? "" : output));
+      if ("${phase}" === "response" && ctx.body && next.length > ctx.body.length + 65535) { unchanged(); return; }
+      ctx.body = next;
+    }
+    Anywhere.done(); unchanged();
+  }
+  try { await ${runner}($request, $response, $done, ${parsed.loonArgumentCode || JSON.stringify(String(parsed.argument || ""))}); }
+  catch (error) { Anywhere.log.error(String(error && error.stack || error)); unchanged(); }
+  ${/\$done/.test(source) ? "await donePromise;" : "unchanged();"}
 }`;
 }
 
@@ -2920,7 +3014,14 @@ function jqToBodyJson(phase, pattern, rawJq) {
   match = jq.match(/^\.[A-Za-z0-9_.$[\]"'-]+\s*=\s*(.+)$/);
   if (match) {
     const left = jq.slice(0, jq.indexOf("=")).trim();
-    return { phase, op: 5, pattern: urlGate(pattern), fields: ["replace", jsonPathFromJq(left), match[1].trim()] };
+    const literal = match[1].trim();
+    try { JSON.parse(literal); } catch { return null; }
+    // jq assignment creates an absent root member. Native replace would leave
+    // it missing; add is the matching upsert when the root parent exists.
+    const rootMember = /^\.[A-Za-z_$][\w$-]*$/.test(left);
+    return { phase, op: 5, pattern: urlGate(pattern), fields: [rootMember ? "add" : "replace", jsonPathFromJq(left), literal],
+      ...(!rootMember ? { degraded: { code: "jq-assignment-parent-sample-required", message: "嵌套 jq 赋值在父路径缺失时会创建结构；当前原生规则不能保证该行为，请核对响应样本。" } } : {}),
+    };
   }
   return null;
 }
@@ -2966,6 +3067,14 @@ function jqMapSelectRemoval(phase, pattern, jq) {
   if (!match) return null;
   const path = jsonPathFromJq(match[1]);
   const selector = match[2].trim();
+  const inMatch = selector.match(/^\.([A-Za-z0-9_$-]+)\s*\|\s*IN\(([\s\S]+)\)\s*\|\s*not$/);
+  if (inMatch) {
+    try {
+      const values = JSON.parse("[" + inMatch[2] + "]");
+      if (values.length && values.every(v => typeof v === "string")) return { phase, op: 5, pattern: urlGate(pattern), fields: ["remove-where-field-in", path, inMatch[1], JSON.stringify(values)] };
+    } catch {}
+    return null;
+  }
 
   const keyMatch = selector.match(/^has\(\s*(["'][^"']+["'])\s*\)\s*\|\s*not$/);
   if (keyMatch) {
@@ -3245,16 +3354,28 @@ function headerRuleFromParts(phase, pattern, action, name, value = "") {
 
 function rejectRule(pattern, content) {
   if (content.kind === "gif") return { phase: 0, op: 0, pattern: urlGate(pattern), fields: ["3"] };
+  if (content.kind === "json") return mapLocalRespondScriptRule(pattern, { status: 200, dataType: "json", data: content.value });
+  if (content.kind === "text" && !content.value || content.kind === "data" && !content.value) {
+    // Native empty text/data submodes produce Anywhere's default payload,
+    // not a zero-byte response. Preserve the source's explicit empty body.
+    return mapLocalRespondScriptRule(pattern, { status: 200, dataType: content.kind === "data" ? "base64" : "text", data: "", ...(content.kind === "data" ? { header: "Content-Type:application/octet-stream" } : {}) });
+  }
   if (content.kind === "data") return { phase: 0, op: 0, pattern: urlGate(pattern), fields: ["4", content.value || ""] };
+  if (content.kind === "legacy-reject") return { phase: 0, op: 0, pattern: urlGate(pattern), fields: ["2", ""], degraded: {
+    code: "reject-connection-sample-required",
+    message: "旧 Loon/Surge 裸 reject 表示拒绝连接，Anywhere 暂无等价 URL 断连操作；仅保留历史 200 默认响应近似，不能视为完整转换。不会扩大为整域名拦截，请实机核对或改用上游明确的状态码响应。",
+  } };
   return { phase: 0, op: 0, pattern: urlGate(pattern), fields: ["2", content.value || ""] };
 }
 
 function rejectContentForAction(rawAction = "", pattern = "") {
   const action = String(rawAction).toLowerCase();
-  if (action === "reject-dict" || action === "reject-json") return { kind: "text", value: "{}" };
-  if (action === "reject-array") return { kind: "text", value: "[]" };
+  if (action === "reject-dict" || action === "reject-json") return { kind: "json", value: "{}" };
+  if (action === "reject-array") return { kind: "json", value: "[]" };
   if (action === "reject-img" || action === "reject-200-img") return { kind: "gif" };
   if (action === "reject-data") return { kind: "data", value: "" };
+  if (action === "reject-200") return { kind: "text", value: "" };
+  if (["reject", "reject-drop", "reject-no-drop"].includes(action)) return { kind: "legacy-reject" };
   if (looksLikeImagePattern(pattern)) return { kind: "gif" };
   return { kind: "text", value: "" };
 }
@@ -3305,7 +3426,7 @@ function captureTemplatePrelude(pattern, targetTemplate) {
 
 function normalizeMitmRulePattern(rule) {
   const next = { ...rule };
-  next.pattern = normalizeQueryBoundary(next.pattern);
+  next.pattern = rule.loonV2 ? rule.pattern : normalizeQueryBoundary(next.pattern);
   return next;
 }
 
@@ -3381,7 +3502,7 @@ function buildReport({ converted, skipped, files, diagnostics }) {
 
 function scriptMetricsForFile(file) {
   const metrics = { scriptRuleCount: 0, totalScriptBytes: 0, maxPerHitScriptBytes: 0 };
-  if (file.type !== "amrs" || !file.content) return metrics;
+  if (!["amrs", "amod"].includes(file.type) || !file.content) return metrics;
   for (const line of String(file.content).split(/\r?\n/)) {
     if (!/^[01],\s*(?:100|101),/.test(line)) continue;
     const fields = parseCsv(line);
@@ -3409,6 +3530,8 @@ function normalizeHostnames(values, diagnostics) {
       diagnostics.push({ level: "warning", code: "complex-hostname-wildcard", message: `复杂 hostname wildcard 已跳过：${raw}`, line: 0, source: raw });
       continue;
     }
+    const unprefixed = String(raw).trim().replace(/^%APPEND%\s*/i, "");
+    if (unprefixed.includes("*") && !/^\*\.[A-Za-z0-9.-]+$/.test(unprefixed)) diagnostics.push({ level: "warning", code: "hostname-wildcard-expanded", message: `Anywhere 不支持 hostname 通配符；${raw} 已转为后缀 ${candidates.join(", ")}，TLS 拦截范围会扩大，URL gate 仍保留原规则范围。`, line: 0, source: raw });
     for (const value of candidates) {
       if (!seen.has(value)) {
         seen.add(value);
@@ -3441,7 +3564,6 @@ function normalizeHostnameCandidates(raw) {
 
   const firstLabel = value.split(".", 1)[0];
   if (firstLabel?.includes("*") && value.includes(".")) {
-    add(value.replace(/\*/g, ""));
     add(value.slice(value.indexOf(".") + 1));
     return uniqueStrings(candidates);
   }
@@ -3549,18 +3671,6 @@ function uniqueStrings(values) {
   return out;
 }
 
-function dedupeMitmRules(rules) {
-  const seen = new Set();
-  const out = [];
-  for (const rule of rules) {
-    const key = [rule.phase, rule.op, rule.pattern, ...rule.fields].join("\u001f");
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(rule);
-  }
-  return out;
-}
-
 function generalizeGroupedHostPatterns(rules, hostnames, diagnostics) {
   const hostnameSet = new Set(hostnames);
   let changed = 0;
@@ -3594,7 +3704,7 @@ function generalizeGroupedHostPattern(pattern, hostnameSet) {
 function mergeSameGateScripts(rules, diagnostics) {
   const groups = new Map();
   for (const rule of rules) {
-    if (rule.op !== 100 || !rule.scriptSource) continue;
+    if (rule.op !== 100 || !rule.scriptSource || rule.loonHTTP) continue;
     const key = `${rule.phase}\u001f${rule.pattern}`;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(rule);
@@ -3619,7 +3729,7 @@ function mergeSameGateScripts(rules, diagnostics) {
 function mergeIdenticalScriptSourcesByPhase(rules, diagnostics) {
   const groups = new Map();
   for (const rule of rules) {
-    if (rule.op !== 100 || !rule.scriptSource || rule.noScriptMerge) continue;
+    if (rule.op !== 100 || !rule.scriptSource || rule.noScriptMerge || rule.loonHTTP) continue;
     const key = `${rule.phase}\u001f${rule.scriptSource}`;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(rule);
@@ -3651,9 +3761,10 @@ function mergeScriptDispatchersByPhase(rules, diagnostics) {
   }
   for (const group of groups.values()) {
     if (group.length < 2) continue;
-    const union = unionRegexPattern(group.map((rule) => rule.pattern));
+    const patterns = group.map((rule) => rule.pattern);
+    const union = new Set(patterns).size === 1 ? patterns[0] : unionRegexPattern(patterns);
     if (!union) continue;
-    const composed = composeGatedProcessScripts(group.map((rule) => ({ pattern: rule.pattern, source: rule.scriptSource })));
+    const composed = composeGatedProcessScripts(group.map((rule) => ({ pattern: rule.pattern, source: rule.scriptSource, loonHTTP: rule.loonHTTP, loonGuard: rule.loonGuard })));
     group[0].pattern = union;
     group[0].scriptSource = composed;
     group[0].fields = [base64(composed)];
@@ -3707,30 +3818,69 @@ function dedupeRoutingRules(rules) {
 }
 
 function composeProcessScripts(sources) {
+  sources = shareStaticRunners(sources);
   const parts = sources.map((source, index) => {
     if (!/function\s+process\s*\(\s*ctx\s*\)/.test(source)) {
       return `function __anywhere_part_${index}(ctx) {\n${source}\n}`;
     }
-    return source.replace(/function\s+process\s*\(\s*ctx\s*\)/, `function __anywhere_part_${index}(ctx)`);
+    return renameProcess(source, `__anywhere_part_${index}`);
   });
-  const calls = sources.map((_, index) => `  __anywhere_part_${index}(ctx);`).join("\n");
-  return `${parts.join("\n\n")}\n\nfunction process(ctx) {\n${calls}\n}`;
+  const calls = sources.map((_, index) => `  await __anywhere_part_${index}(ctx);`).join("\n");
+  return `${parts.join("\n\n")}\n\nasync function process(ctx) {\n${calls}\n}`;
 }
 
 function composeGatedProcessScripts(items) {
+  const shared = shareStaticRunners(items.map(item => item.source));
+  items = items.map((item, index) => ({ ...item, source: shared[index] }));
   const parts = items.map((item, index) => {
     if (!/function\s+process\s*\(\s*ctx\s*\)/.test(item.source)) {
       return `function __anywhere_part_${index}(ctx) {\n${item.source}\n}`;
     }
-    return item.source.replace(/function\s+process\s*\(\s*ctx\s*\)/, `function __anywhere_part_${index}(ctx)`);
+    return renameProcess(item.source, `__anywhere_part_${index}`);
   });
-  const calls = items.map((item, index) => `  if ((new RegExp(${JSON.stringify(item.pattern)})).test(url)) __anywhere_part_${index}(ctx);`).join("\n");
-  return `${parts.join("\n\n")}\n\nfunction process(ctx) {\n  var url = ctx.url || "";\n${calls}\n}`;
+  const calls = items.map((item, index) => item.loonHTTP
+    ? `  if (!__loonSelected && (new RegExp(${JSON.stringify(item.pattern)})).test(url) && (${item.loonGuard || "true"})) { __loonSelected = true; await __anywhere_part_${index}(ctx); }`
+    : `  if ((new RegExp(${JSON.stringify(item.pattern)})).test(url)) await __anywhere_part_${index}(ctx);`).join("\n");
+  return `${parts.join("\n\n")}\n\nasync function process(ctx) {\n  var url = ctx.url || "", __loonSelected = false;\n${calls}\n}`;
+}
+
+function renameProcess(source, name) {
+  const node = parseScript(source)?.body.find(node => node.type === "FunctionDeclaration" && node.id.name === "process");
+  if (!node) return `function ${name}(ctx) {\n${source}\n}`;
+  return source.slice(0, node.id.start) + name + source.slice(node.id.end);
+}
+
+function sourceId(source) {
+  // Two independent 32-bit hashes; sharing also verifies exact source equality.
+  let a = 2166136261, b = 5381;
+  for (const c of source) { a = Math.imul(a ^ c.charCodeAt(0), 16777619); b = Math.imul(b, 33) ^ c.charCodeAt(0); }
+  return (a >>> 0).toString(16) + "_" + (b >>> 0).toString(16);
+}
+
+function shareStaticRunners(sources) {
+  const seen = new Map();
+  return sources.map(source => {
+    const ast = parseScript(source);
+    const runner = ast?.body.find(node => node.type === "FunctionDeclaration" && node.id.name.startsWith("__converter_runner_"));
+    if (!runner) return source;
+    const text = source.slice(runner.start, runner.end);
+    if (seen.get(runner.id.name) === text) return source.slice(0, runner.start) + source.slice(runner.end);
+    seen.set(runner.id.name, text);
+    return source;
+  });
 }
 
 function unionRegexPattern(patterns) {
   const unique = uniqueStrings(patterns);
   if (unique.length < 2) return "";
+  const flags = unique.map(pattern => pattern.match(/^\(\?([ims]+)\)/)?.[1] || "");
+  if (flags.some(Boolean)) {
+    // Keep common ICU modifiers at the beginning instead of burying (?i)
+    // inside every union branch. Mixed modes remain independent native rules.
+    if (!flags.every(flag => flag === flags[0])) return "";
+    const bare = unique.map(pattern => pattern.replace(/^\(\?[ims]+\)/, ""));
+    return `(?${flags[0]})` + (new Set(bare).size === 1 ? bare[0] : unionRegexPattern(bare));
+  }
   const compact = compactRegexUnion(unique);
   if (compact) return compact;
   return unique.map((pattern) => `(?:${pattern})`).join("|");
@@ -3796,7 +3946,9 @@ function validateAmrsRuleLine(line) {
   if (![0, 1].includes(phase)) return { level: "error", code: "invalid-phase", message: "phase 必须是 0 或 1。" };
   if (!MITM_OPS.has(op)) return { level: "error", code: "invalid-op", message: `不支持 op=${fields[1]}。` };
   try {
-    new RegExp(fields[2]);
+    const nativePattern = fields[2].replace(/^\(\?([ims]+)\)/, "");
+    const nativeFlags = fields[2].match(/^\(\?([ims]+)\)/)?.[1] || "";
+    new RegExp(nativePattern, nativeFlags);
   } catch (error) {
     return { level: "error", code: "invalid-regex", message: error.message };
   }

@@ -1,11 +1,11 @@
 # Anywhere Native Capability Audit
 
-This table is generated from the current Anywhere MITM script engine source and documents how the generic converter uses those native capabilities. It is a guardrail: adding a converter feature should update this file and the tests together.
+This table is maintained against Anywhere source, not automatically generated. On 2026-10-16, local 381f9703 and remote 5b101e95 (2.5/404) have identical MITM runtime/docs. Compared with the previous ea12a6e5 baseline, AMOD description metadata is new; no new MITM script API was found. Adding a converter feature should update this file and the tests together.
 
 | Anywhere native capability | Source API shape | Converter status | Notes |
 | --- | --- | --- | --- |
 | `Anywhere.codec.utf8` | `encode`, `decode` | bridged | Used by wrappers and generated scripts. Also backs `TextEncoder` / `TextDecoder` fallback. |
-| `Anywhere.codec.base64` | `encode`, `decode` | bridged | Used for script loading and `atob` / `btoa` fallback. |
+| `Anywhere.codec.base64` | `encode`, `decode` | bridged | AMRS scripts are base64; wrappers now use static runners, not internal base64 source loading. Also backs `atob` / `btoa` fallback. |
 | `Anywhere.codec.base64url` | `encode`, `decode` | documented only | Available to hand-written scripts. No common Loon/Surge API needs automatic mapping yet. |
 | `Anywhere.codec.hex` | `encode`, `decode` | documented only | Available to hand-written scripts. |
 | `Anywhere.codec.gzip` | `encode`, `decode` | bridged | Exposed through `$utils.gzip` / `$utils.ungzip`. |
@@ -28,6 +28,10 @@ This table is generated from the current Anywhere MITM script engine source and 
 | Response body codec negotiation | Accept-Encoding clamp + Content-Encoding decode | native runtime | Converter relies on Anywhere's runtime clamp/decode for body rules and no longer emits synthetic `accept-encoding: identity` preprocess rules. |
 
 ## Explicit Non-Goals
+
+Response ctx has response headers/body, not the original request headers/body. Compatibility objects must not substitute the former for the latter. Native header-replace does not insert missing fields; static JS header assignment uses delete then add. Ordered MITM mutations must not be globally deduplicated. QX support follows the same native contracts; see [compatibility scope](qx-compatibility.md).
+
+Plugin conversion now defaults to `.amod`, with plain rule sets remaining ARRS and explicit standalone output available. Native model encoding estimates replace per-rule padding; see [module output](module-output.md) for budget and subscription behavior. URL/timers are not native globals: common HTTP(S) URL operations are shimmed, genuine delays are not fabricated. Native JSON preserves precision/unchanged text differently from JS; sample-required diagnostics remain.
 
 - The converter does not translate arbitrary `crypto.subtle` workflows into `Anywhere.crypto`.
 - The converter does not translate generic protobuf bundles into field-level native edits.
